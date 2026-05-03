@@ -107,6 +107,11 @@ class ChatRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/")
+async def root():
+    return {"message": "PDF Chat Agent API", "status": "running"}
+
+
 @app.get("/health", summary="Health check")
 async def health():
     """
