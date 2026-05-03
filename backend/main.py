@@ -57,15 +57,13 @@ histories: dict[str, list[dict]] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     api_key_status = "SET" if os.getenv("MISTRAL_API_KEY") else "*** NOT SET — /chat will fail ***"
-    chroma_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
     print("=" * 62)
     print("  PDF-Constrained Conversational Agent")
     print("  ─────────────────────────────────────────────────────────")
     print(f"  MISTRAL_API_KEY : {api_key_status}")
-    print(f"  MAX_PDF_SIZE_MB    : {MAX_PDF_SIZE_MB}")
-    print(f"  CHROMA_PERSIST_DIR : {chroma_dir}")
-    print(f"  ALLOWED_ORIGINS    : {ALLOWED_ORIGINS}")
+    print(f"  MAX_PDF_SIZE_MB : {MAX_PDF_SIZE_MB}")
+    print(f"  ALLOWED_ORIGINS : {ALLOWED_ORIGINS}")
     print("=" * 62)
     yield
     print("[main] Shutdown complete.")

@@ -1,29 +1,31 @@
 """
-embeddings.py — Embedding generation and ChromaDB vector store operations.
+embeddings.py — Embedding generation and in-memory vector store.
 
-Module-level singletons are used for both the sentence-transformer model and
-the ChromaDB client so they are initialised once per process, not per request.
+Replaces ChromaDB with exact numpy cosine similarity search.
+For the collection sizes involved (tens to low hundreds of chunks per PDF),
+exact search is both faster and more accurate than HNSW approximation, and
+uses a fraction of the memory (no C++ index, no ONNX runtime, no SQLite).
 
-Each uploaded PDF is stored in its own ChromaDB collection identified by
-session_id, keeping sessions fully isolated with zero cross-contamination.
+Memory per session: ~70 KB (46 chunks × 384 dims × float32).
+The sentence-transformer model (~90 MB) is loaded once and shared across sessions.
 """
 
-from __future__ import annotations  # makes all annotations lazy strings — never evaluated at runtime
+from __future__ import annotations
 
 import gc
-import os
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 
-import chromadb
-from chromadb.config import Settings
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
-# Module-level singletons — initialised lazily on first use
+# Module-level singletons
 # ---------------------------------------------------------------------------
 
-_model: SentenceTransformer | None = None
-_chroma_client: Any = None  # chromadb.PersistentClient is a factory fn, not a class
+_model: Optional[SentenceTransformer] = None
+
+# session_id → {"embeddings": np.ndarray shape (N, D), "chunks": List[dict]}
+_store: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_model() -> SentenceTransformer:
@@ -36,58 +38,35 @@ def _get_model() -> SentenceTransformer:
     return _model
 
 
-def _get_chroma_client() -> Any:
-    """Return the shared ChromaDB client, creating it on first call."""
-    global _chroma_client
-    if _chroma_client is None:
-        persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
-        print(f"[embeddings] Initialising ChromaDB client at '{persist_dir}'…")
-        _chroma_client = chromadb.PersistentClient(
-            path=persist_dir,
-            settings=Settings(anonymized_telemetry=False),
-        )
-        print("[embeddings] ChromaDB client ready.")
-    return _chroma_client
+def _normalise(vecs: np.ndarray) -> np.ndarray:
+    """L2-normalise rows so dot product equals cosine similarity."""
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return vecs / norms
 
 
-def _encode_in_batches(model: SentenceTransformer, texts: List[str], batch_size: int = 8) -> List[List[float]]:
-    """Encode texts in small batches with gc between each to keep peak memory low."""
-    all_embeddings: List[List[float]] = []
+def _encode_in_batches(model: SentenceTransformer, texts: List[str], batch_size: int = 8) -> np.ndarray:
+    """Encode texts in small batches with gc between each. Returns (N, D) float32 array."""
+    batches = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         embs = model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
-        all_embeddings.extend(embs.tolist())
-        del embs
+        batches.append(embs.astype(np.float32))
         gc.collect()
-    return all_embeddings
-
-
-def _collection_name(session_id: str) -> str:
-    """
-    Derive a valid ChromaDB collection name from a session_id.
-
-    ChromaDB collection names must be 3-63 chars, start/end with a
-    lowercase letter or digit, and contain only [a-z0-9_-].
-    UUIDs with hyphens already satisfy this, but we strip hyphens and
-    add a stable prefix to guarantee it starts with a letter.
-    """
-    return "s" + session_id.replace("-", "")
+    return np.vstack(batches)
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — identical signatures to the ChromaDB version
 # ---------------------------------------------------------------------------
 
 
 def embed_and_store(chunks: List[dict], session_id: str) -> None:
     """
-    Embed all chunks and persist them in a per-session ChromaDB collection.
-
-    Creates the collection if it doesn't exist (idempotent upsert semantics),
-    so re-uploading the same session_id safely overwrites previous data.
+    Embed all chunks and store them in the in-memory session store.
 
     Args:
-        chunks:     Output of pdf_processor.chunk_pages() —
+        chunks:     Output of pdf_processor.parse_and_chunk() —
                     list of {"text", "page", "chunk_index"} dicts.
         session_id: UUID string identifying this upload session.
     """
@@ -95,33 +74,16 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
         raise ValueError("chunk list is empty — nothing to embed")
 
     model = _get_model()
-    client = _get_chroma_client()
-    col_name = _collection_name(session_id)
-
-    # Cosine similarity matches what sentence-transformers is trained for
-    collection = client.get_or_create_collection(
-        name=col_name,
-        metadata={"hnsw:space": "cosine"},
-    )
-
     texts = [c["text"] for c in chunks]
+
     print(f"[embeddings] Embedding {len(texts)} chunk(s) for session '{session_id}'…")
-    embeddings = _encode_in_batches(model, texts, batch_size=8)
-
-    ids = [f"{session_id}_{c['chunk_index']}" for c in chunks]
-    metadatas = [{"page": c["page"], "chunk_index": c["chunk_index"]} for c in chunks]
-
-    # upsert so duplicate uploads don't cause primary-key conflicts
-    collection.upsert(
-        ids=ids,
-        embeddings=embeddings,
-        documents=texts,
-        metadatas=metadatas,
-    )
-    del embeddings, texts
+    raw = _encode_in_batches(model, texts)
+    normalised = _normalise(raw)
+    del raw
     gc.collect()
 
-    print(f"[embeddings] Stored {len(chunks)} chunk(s) in collection '{col_name}'.")
+    _store[session_id] = {"embeddings": normalised, "chunks": list(chunks)}
+    print(f"[embeddings] Stored {len(chunks)} chunk(s) for session '{session_id}'.")
 
 
 def retrieve_relevant_chunks(
@@ -130,89 +92,66 @@ def retrieve_relevant_chunks(
     top_k: int = 10,
 ) -> List[dict]:
     """
-    Retrieve the top-k most relevant chunks for a user query.
-
-    Embeds the query with the same model used at index time, then runs
-    an approximate nearest-neighbour search in the session's collection.
+    Retrieve the top-k most relevant chunks for a query using exact cosine similarity.
 
     Args:
         query:      The user's natural-language question.
         session_id: UUID string identifying the active upload session.
-        top_k:      Number of chunks to return (default 5).
+        top_k:      Number of chunks to return.
 
     Returns:
         List of dicts sorted by relevance (most relevant first):
             [{"text": str, "page": int, "chunk_index": int, "score": float}, ...]
-        score is cosine similarity in [0, 1] (higher = more relevant).
-        Returns an empty list if the session collection does not exist.
+        Returns empty list if session does not exist.
     """
+    if session_id not in _store:
+        print(f"[embeddings] Session '{session_id}' not found — returning empty results.")
+        return []
+
     model = _get_model()
-    client = _get_chroma_client()
-    col_name = _collection_name(session_id)
+    entry = _store[session_id]
+    stored_embs: np.ndarray = entry["embeddings"]  # (N, D), already normalised
+    chunks: List[dict] = entry["chunks"]
 
-    # Gracefully handle missing session
-    existing = [c.name for c in client.list_collections()]
-    if col_name not in existing:
-        print(f"[embeddings] Collection '{col_name}' not found — returning empty results.")
-        return []
+    query_vec = model.encode([query], show_progress_bar=False, convert_to_numpy=True).astype(np.float32)
+    query_vec = _normalise(query_vec)  # (1, D)
 
-    collection = client.get_collection(name=col_name)
-    n_docs = collection.count()
-    if n_docs == 0:
-        return []
+    scores = (stored_embs @ query_vec.T).squeeze()  # (N,)
+    if scores.ndim == 0:
+        scores = scores.reshape(1)
 
-    # Clamp top_k to the number of stored documents
-    k = min(top_k, n_docs)
+    k = min(top_k, len(chunks))
+    # argpartition is O(N) — faster than full sort for large N
+    top_indices = np.argpartition(scores, -k)[-k:]
+    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
 
-    print(f"[embeddings] Retrieving top-{k} chunk(s) for session '{session_id}'…")
-    query_embedding = model.encode([query], show_progress_bar=False).tolist()
-
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    # ChromaDB returns nested lists (one row per query); we sent one query
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    # distances are in [0, 2] for cosine space (distance = 1 - similarity)
-    distances = results["distances"][0]
-
-    chunks = []
-    for doc, meta, dist in zip(docs, metas, distances):
-        chunks.append(
-            {
-                "text": doc,
-                "page": meta["page"],
-                "chunk_index": meta["chunk_index"],
-                "score": round(1.0 - dist, 4),  # convert distance → similarity
-            }
-        )
+    results = []
+    for idx in top_indices:
+        c = chunks[int(idx)]
+        results.append({
+            "text":        c["text"],
+            "page":        c["page"],
+            "chunk_index": c["chunk_index"],
+            "score":       round(float(scores[idx]), 4),
+        })
 
     print(
-        f"[embeddings] Retrieved {len(chunks)} chunk(s); "
-        f"top score={chunks[0]['score'] if chunks else 'n/a'}."
+        f"[embeddings] Retrieved {len(results)} chunk(s); "
+        f"top score={results[0]['score'] if results else 'n/a'}."
     )
-    return chunks
+    return results
 
 
 def delete_session(session_id: str) -> None:
     """
-    Delete the ChromaDB collection for a session, freeing its vector data.
-
-    Safe to call even if the session never existed or was already deleted.
+    Remove a session's vectors from memory.
 
     Args:
         session_id: UUID string identifying the session to remove.
     """
-    client = _get_chroma_client()
-    col_name = _collection_name(session_id)
-
-    existing = [c.name for c in client.list_collections()]
-    if col_name not in existing:
-        print(f"[embeddings] Collection '{col_name}' does not exist — nothing to delete.")
+    if session_id not in _store:
+        print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
         return
-
-    client.delete_collection(name=col_name)
-    print(f"[embeddings] Deleted collection '{col_name}' for session '{session_id}'.")
+    del _store[session_id]
+    gc.collect()
+    print(f"[embeddings] Deleted session '{session_id}'.")
