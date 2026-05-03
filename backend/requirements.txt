@@ -9,9 +9,8 @@ PyMuPDF==1.24.13
 
 # Embeddings
 sentence-transformers==3.3.1
-torch==2.1.0          # CPU-only build; pinned to match torchvision + numpy below
-torchvision==0.16.0   # must match torch major.minor exactly
-numpy==1.26.4         # torch 2.1.0 C extensions were compiled against NumPy 1.x
+torch==2.1.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+numpy==1.26.4
 
 # Vector store
 chromadb==0.5.23
