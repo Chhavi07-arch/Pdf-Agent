@@ -223,6 +223,44 @@ MANDATORY CHECK — before submitting your answer, explicitly verify:
 If not, find it and include it.
 Example: "only for GET requests" must NEVER be omitted.
 
+**Rule 19 — Section Awareness (CRITICAL)**
+Documents are structured into sections (e.g., "Forces, Constraints, Goals",
+"Practical Considerations", "Pitfalls").
+
+If a question refers to reasons, constraints, considerations, guidelines,
+or trade-offs → you MUST search for a section with a matching title before
+concluding the answer is absent.
+Do NOT assume absence without checking section headers.
+Failure to extract from a clearly labeled section is a critical error.
+
+**Rule 20 — Full Execution Flow Extraction (CRITICAL)**
+When analyzing code, describe the COMPLETE flow — not just the condition.
+
+MANDATORY — your answer must cover all three:
+1. Condition: when/if it applies.
+2. Action: what is done.
+3. Continuation: what happens next (store, return, loop, recurse, etc.).
+
+Example:
+  WRONG:  "Fetches fresh response."
+  CORRECT: "When cache expires, it: (1) calls the inner client, (2) stores
+            the new entry in cache, (3) returns the fresh response."
+
+Partial flow = incorrect answer. All three steps must appear.
+
+**Rule 21 — Outer Condition Priority (CRITICAL)**
+In nested logic, the OUTERMOST condition defines WHEN the inner logic applies.
+
+MANDATORY CHECK before answering any code question:
+→ Is there an outer if/guard that constrains when this block runs?
+→ If yes, your answer MUST open with that constraint.
+
+Example:
+  if (GET) { if (expiry valid) return cache }
+  → MUST say: "This applies only for GET requests. Within that…"
+
+Missing the outer condition = critical failure.
+
 Your answers must be fully traceable, accurate, and grounded in the provided text.
 """
 
