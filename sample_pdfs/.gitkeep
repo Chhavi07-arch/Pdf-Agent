@@ -1,0 +1,6 @@
+# Place test PDFs here.
+# Suggested test cases:
+#   - A technical whitepaper (tests factual Q&A + citation accuracy)
+#   - A multi-section report (tests cross-section retrieval)
+#   - A short single-page doc (tests boundary / refusal when question is out of scope)
+#   - A PDF with tables/figures (tests graceful degradation on non-prose content)

@@ -1,0 +1,22 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# OpenRouter (OpenAI-compatible REST API — uses stdlib requests, no extra SDK)
+
+# PDF parsing
+PyMuPDF==1.24.13
+
+# Embeddings
+sentence-transformers==3.3.1
+torch==2.1.0          # CPU-only build; pinned to match torchvision + numpy below
+torchvision==0.16.0   # must match torch major.minor exactly
+numpy==1.26.4         # torch 2.1.0 C extensions were compiled against NumPy 1.x
+
+# Vector store
+chromadb==0.5.23
+
+# Utilities
+python-multipart==0.0.12   # required for FastAPI file uploads
+python-dotenv==1.0.1
+pydantic==2.10.3
