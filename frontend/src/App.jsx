@@ -1,10 +1,15 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import PDFUploader from './components/PDFUploader'
 import ChatWindow from './components/ChatWindow'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 export default function App() {
+  useEffect(() => {
+    // Wake up Render backend on app load
+    fetch(`${API_BASE}/health`).catch(() => {})
+  }, [])
+
   // uploadedPdfs: [{sessionId, filename, chunkCount}, ...]
   const [uploadedPdfs, setUploadedPdfs]       = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
