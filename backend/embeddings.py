@@ -10,6 +10,7 @@ session_id, keeping sessions fully isolated with zero cross-contamination.
 
 from __future__ import annotations  # makes all annotations lazy strings — never evaluated at runtime
 
+import gc
 import os
 from typing import Any, List
 
@@ -47,6 +48,18 @@ def _get_chroma_client() -> Any:
         )
         print("[embeddings] ChromaDB client ready.")
     return _chroma_client
+
+
+def _encode_in_batches(model: SentenceTransformer, texts: List[str], batch_size: int = 8) -> List[List[float]]:
+    """Encode texts in small batches with gc between each to keep peak memory low."""
+    all_embeddings: List[List[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        embs = model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+        all_embeddings.extend(embs.tolist())
+        del embs
+        gc.collect()
+    return all_embeddings
 
 
 def _collection_name(session_id: str) -> str:
@@ -93,7 +106,7 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
 
     texts = [c["text"] for c in chunks]
     print(f"[embeddings] Embedding {len(texts)} chunk(s) for session '{session_id}'…")
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=False).tolist()
+    embeddings = _encode_in_batches(model, texts, batch_size=8)
 
     ids = [f"{session_id}_{c['chunk_index']}" for c in chunks]
     metadatas = [{"page": c["page"], "chunk_index": c["chunk_index"]} for c in chunks]
@@ -105,6 +118,8 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
         documents=texts,
         metadatas=metadatas,
     )
+    del embeddings, texts
+    gc.collect()
 
     print(f"[embeddings] Stored {len(chunks)} chunk(s) in collection '{col_name}'.")
 

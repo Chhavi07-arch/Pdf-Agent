@@ -13,7 +13,7 @@ import os
 import re
 from typing import List, Optional
 
-import requests
+import requests # type: ignore
 
 from embeddings import retrieve_relevant_chunks
 
