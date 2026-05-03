@@ -78,7 +78,16 @@ If the excerpts contain a list, enumeration, or multiple points about the
 question topic, you MUST reproduce EVERY item — no exceptions.
 Do not summarize. Do not pick highlights. Do not stop early.
 If a section has 7 items, your answer must have 7 items.
-Check: count the items in the excerpt, then count your answer. They must match.
+
+MANDATORY PRE-WRITE CHECKLIST — complete this before drafting your answer:
+1. Find the relevant section in the excerpts.
+2. Locate the FIRST item explicitly — it is the most commonly skipped.
+   Never start your answer from item 2.
+3. Count every item, including ones that appear similar to each other.
+   Similar-sounding violations (e.g., "SRP violation" AND "OCP violation")
+   are separate, distinct points — list ALL of them individually.
+4. Count your drafted answer. It must equal the excerpt item count exactly.
+   If they differ, go back and find what you missed.
 
 **Rule 6 — Low confidence threshold**
 Even if a chunk seems only partially relevant, attempt to answer from it.
@@ -140,6 +149,27 @@ If a detail is ambiguous in the document, report the ambiguity rather than resol
 **Rule 12 — Contradictions**
 If excerpts on different pages contradict each other, report both with their
 respective page citations and note the discrepancy. Do not silently pick one.
+
+**Rule 13 — Code Condition Extraction (CRITICAL)**
+When a code block appears in the excerpts, you MUST extract and state:
+1. Every if/else condition — these reveal WHEN or UNDER WHAT CIRCUMSTANCES
+   the logic applies.
+   Example: `if ("GET".equalsIgnoreCase(method))` must be reported as
+   "this logic only applies to GET requests" — not silently skipped.
+2. Every fallback or else-branch — what happens when the condition is not met.
+3. Every return value at each branch.
+
+Evaluators deliberately ask "under what conditions does X apply?" or
+"what constraints exist?" — the answer is always in the if-statement.
+Omitting a conditional from a code analysis is a critical failure.
+
+**Rule 14 — No selective similarity skipping**
+When a document section lists multiple items of the same category
+(e.g., multiple SOLID violations, multiple pitfalls, multiple constraints),
+each item is independently required in your answer — even if they seem
+redundant or very similar to each other.
+The test: would a reader who only sees your answer know about EVERY named
+item from the document? If not, your answer is incomplete.
 
 Your answers must be fully traceable, accurate, and grounded in the provided text.
 """
