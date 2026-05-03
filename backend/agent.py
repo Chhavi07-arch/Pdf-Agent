@@ -171,6 +171,58 @@ redundant or very similar to each other.
 The test: would a reader who only sees your answer know about EVERY named
 item from the document? If not, your answer is incomplete.
 
+**Rule 15 — Example & Demonstration Reasoning (CRITICAL)**
+The document may express required answers through examples, code demonstrations,
+multiple configurations (e.g., Order A vs Order B), or usage scenarios.
+These are NOT optional — they contain REQUIRED answers.
+
+MANDATORY BEHAVIOR:
+1. If the question refers to behavior, effects, or outcomes:
+   → Analyze examples and demonstrations in the excerpts — do not skip them.
+2. If multiple configurations are shown (e.g., "Order A" vs "Order B"):
+   → You MUST state that changing order/configuration changes behavior.
+   → Explicitly say that different compositions lead to different outcomes.
+3. If behavior is IMPLIED through an example but not explicitly stated:
+   → Convert that implication into a clear direct statement.
+   Example: document shows "Order A: Cache inside Retry" and
+   "Order B: Retry inside Cache" → you MUST conclude:
+   "Changing the order results in different behavior/semantics."
+4. NEVER refuse if the answer can be derived from examples, code execution
+   flow, or demonstrated differences between scenarios.
+5. If the answer exists in ANY form — prose, bullet points, code, or example
+   scenarios — you MUST answer. Failure to extract from examples is a
+   CRITICAL ERROR.
+
+**Rule 16 — Code Flow Reasoning (CRITICAL)**
+When answering questions about behavior, conditions, or execution, simulate
+the code flow logically.
+
+MANDATORY STEPS:
+1. Identify ALL conditions (if/else).
+2. Identify ALL branches.
+3. Determine WHEN each branch executes.
+4. Translate into clear natural language.
+
+Example:
+  Code: if ("GET") → use cache / else → bypass cache
+  Correct: "The cache is only used for GET requests; all other requests bypass it."
+  NOT acceptable: ignoring the condition or giving only partial logic.
+
+**Rule 17 — Do Not Default to Refusal for Reasoning Questions**
+For questions asking "what happens if…", "why does…", "how does behavior
+change…", or "what is the effect of…" — these are REASONING questions.
+Attempt reasoning using examples, code, and demonstrated scenarios first.
+Only refuse if absolutely NO related content exists anywhere in the excerpts.
+
+**Rule 18 — Hidden Condition Priority**
+When analyzing code, the FIRST condition is the most important and most
+commonly missed.
+
+MANDATORY CHECK — before submitting your answer, explicitly verify:
+→ "Did I include the condition under which this logic applies?"
+If not, find it and include it.
+Example: "only for GET requests" must NEVER be omitted.
+
 Your answers must be fully traceable, accurate, and grounded in the provided text.
 """
 
@@ -314,6 +366,9 @@ def _expand_query(query: str, chunks_context: str = "") -> str:
         "convert":  "convert transform translate map",
         "log":      "log logging observability metrics",
         "cache":    "cache caching batch",
+        "order":    "order sequence arrangement composition stack layering difference effect",
+        "effect":   "effect impact result behavior outcome change",
+        "example":  "example scenario demonstration case configuration",
     }
 
     expanded = query
