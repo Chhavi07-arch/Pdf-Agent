@@ -274,3 +274,49 @@ def delete_session(session_id: str) -> None:
 
     client.delete_collection(collection_name=session_id)
     print(f"[embeddings] Deleted Qdrant collection '{session_id}'.")
+
+
+# ---------------------------------------------------------------------------
+# Startup utilities
+# ---------------------------------------------------------------------------
+
+
+def warmup() -> None:
+    """
+    Pre-initialize the embedding model and Qdrant client.
+
+    Called during application startup so the first upload does not bear the
+    cold-start penalty of loading the ~90 MB sentence-transformer model and
+    establishing the Qdrant connection.  Both operations are idempotent —
+    subsequent calls return the already-initialized singletons immediately.
+    """
+    print("[embeddings] Warmup: loading model and Qdrant client…")
+    _get_model()
+    _get_client()
+    print("[embeddings] Warmup complete.")
+
+
+def get_status() -> dict:
+    """
+    Return the initialization state of module-level singletons.
+    Used by the /health/debug endpoint — never raises.
+    """
+    return {
+        "model_loaded":      _model is not None,
+        "client_initialized": _client is not None,
+    }
+
+
+def check_qdrant_connectivity() -> bool:
+    """
+    Probe Qdrant with a lightweight list-collections call.
+    Returns True if the call succeeds, False on any error.
+    """
+    if _client is None:
+        return False
+    try:
+        _client.get_collections()
+        return True
+    except Exception as exc:
+        print(f"[embeddings] Qdrant connectivity check failed: {exc!r}")
+        return False
