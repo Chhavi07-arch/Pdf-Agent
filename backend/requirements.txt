@@ -4,7 +4,8 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 
-# OpenRouter (OpenAI-compatible REST API — uses stdlib requests, no extra SDK)
+# Mistral API (OpenAI-compatible REST endpoint — plain requests, no SDK needed)
+requests==2.32.3
 
 # PDF parsing
 PyMuPDF==1.24.13
@@ -13,6 +14,12 @@ PyMuPDF==1.24.13
 sentence-transformers==3.3.1
 torch==2.4.0
 numpy==1.26.4
+
+# Vector database
+qdrant-client==1.12.1
+
+# Text splitting (used in chunking layer — installed now, wired in next step)
+langchain-text-splitters==0.3.8
 
 # Utilities
 python-multipart==0.0.12   # required for FastAPI file uploads

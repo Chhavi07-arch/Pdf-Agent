@@ -4,10 +4,30 @@ pdf_processor.py — PDF parsing and text chunking pipeline.
 Converts raw PDF bytes into a flat list of overlapping text chunks,
 each tagged with the source page number. No disk I/O — operates
 entirely in memory using PyMuPDF (fitz).
+
+Chunking strategy:
+  • RecursiveCharacterTextSplitter walks a separator hierarchy:
+      paragraph breaks (\n\n) → line breaks (\n) → sentence ends (. ) →
+      word boundaries ( ) → character fallback
+    so chunks end at natural linguistic boundaries rather than mid-sentence.
+  • Each page is split INDEPENDENTLY — a chunk never crosses a page boundary.
+    This guarantees that the page metadata on every chunk is always accurate,
+    which is the foundation of trustworthy [Page N] citations.
+  • chunk_size=900 chars (~130 words) captures a full paragraph as one unit,
+    giving the embedding model enough context to represent a complete idea.
+  • chunk_overlap=200 chars ensures sentences near chunk boundaries appear in
+    both adjacent chunks, so the retriever never misses a fact just because it
+    straddled a boundary.
 """
 
-import fitz  # PyMuPDF
 from typing import List
+
+import fitz  # PyMuPDF
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Separator hierarchy: try coarser splits first, fall back to finer ones.
+# This keeps sentences whole unless absolutely necessary.
+_SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", " ", ""]
 
 
 def parse_pdf(pdf_bytes: bytes) -> List[dict]:
@@ -62,55 +82,62 @@ def parse_pdf(pdf_bytes: bytes) -> List[dict]:
 
 def chunk_pages(
     pages: List[dict],
-    chunk_size: int = 400,
-    overlap: int = 80,
+    chunk_size: int = 900,
+    chunk_overlap: int = 200,
 ) -> List[dict]:
     """
-    Split page texts into overlapping fixed-size character windows.
+    Split page texts into overlapping chunks using RecursiveCharacterTextSplitter.
 
-    Each page is chunked independently so a chunk never spans two pages,
-    preserving clean page-number attribution in citations.
+    Each page is split INDEPENDENTLY so a chunk never spans two pages,
+    preserving accurate page-number attribution in citations.
+
+    RecursiveCharacterTextSplitter walks a separator hierarchy (paragraph →
+    line → sentence → word → character) and only falls back to a coarser
+    split if the text at a given boundary would still exceed chunk_size.
+    In practice this means almost all chunks end at sentence or paragraph
+    boundaries rather than mid-word like the old character-window approach.
 
     Args:
-        pages:      Output of parse_pdf() — list of {"page", "text"} dicts.
-        chunk_size: Target character count for each chunk (default 500).
-        overlap:    Characters shared between consecutive chunks on the same
-                    page, giving the retriever context around chunk boundaries
-                    (default 50).
+        pages:        Output of parse_pdf() — list of {"page", "text"} dicts.
+        chunk_size:   Target character count per chunk (default 900).
+                      ~130 words, enough to capture a full paragraph as one
+                      semantic unit without diluting the embedding.
+        chunk_overlap: Characters shared between consecutive chunks on the same
+                      page (default 200, ~22% of chunk_size). Ensures sentences
+                      near chunk boundaries are embedded in both neighbours.
 
     Returns:
         Flat list of chunk dicts:
             {"text": str, "page": int, "chunk_index": int}
         chunk_index is a global counter across all pages, 0-based.
     """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=_SEPARATORS,
+        length_function=len,       # character count — deterministic, no tokeniser
+        is_separator_regex=False,
+        strip_whitespace=True,
+    )
+
     chunks: List[dict] = []
     chunk_index = 0
 
     for page_data in pages:
-        text = page_data["text"]
         page_num = page_data["page"]
-        start = 0
+        # Split this page's text in isolation — cross-page chunks are never produced.
+        page_chunks = splitter.split_text(page_data["text"])
 
-        while start < len(text):
-            end = start + chunk_size
-            chunk_text = text[start:end].strip()
-
-            if chunk_text:
+        for chunk_text in page_chunks:
+            if chunk_text:  # strip_whitespace=True handles leading/trailing, but guard anyway
                 chunks.append(
                     {
-                        "text": chunk_text,
-                        "page": page_num,
+                        "text":        chunk_text,
+                        "page":        page_num,
                         "chunk_index": chunk_index,
                     }
                 )
                 chunk_index += 1
-
-            # Stop if we've consumed the full page text
-            if end >= len(text):
-                break
-
-            # Slide forward, keeping `overlap` chars of context
-            start = end - overlap
 
     print(f"[pdf_processor] Created {len(chunks)} chunk(s) from {len(pages)} page(s).")
     return chunks
@@ -118,8 +145,8 @@ def chunk_pages(
 
 def parse_and_chunk(
     pdf_bytes: bytes,
-    chunk_size: int = 400,
-    overlap: int = 80,
+    chunk_size: int = 900,
+    chunk_overlap: int = 200,
 ) -> List[dict]:
     """
     Full pipeline: bytes → parsed pages → chunks.
@@ -127,15 +154,15 @@ def parse_and_chunk(
     Convenience wrapper that calls parse_pdf then chunk_pages.
 
     Args:
-        pdf_bytes:  Raw bytes of the uploaded PDF.
-        chunk_size: Passed through to chunk_pages (default 500 chars).
-        overlap:    Passed through to chunk_pages (default 50 chars).
+        pdf_bytes:    Raw bytes of the uploaded PDF.
+        chunk_size:   Passed through to chunk_pages (default 900 chars).
+        chunk_overlap: Passed through to chunk_pages (default 200 chars).
 
     Returns:
-        Flat list of chunk dicts ready for embedding and storage.
+        Flat list of chunk dicts ready for embedding and Qdrant storage.
 
     Raises:
         ValueError: Propagated from parse_pdf for bad PDFs.
     """
     pages = parse_pdf(pdf_bytes)
-    return chunk_pages(pages, chunk_size=chunk_size, overlap=overlap)
+    return chunk_pages(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)

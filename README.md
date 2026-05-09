@@ -27,13 +27,13 @@ React + Vite (Vercel)
  │  VITE_API_BASE_URL
  ▼
 FastAPI (Render)
- ├── POST /upload  →  pdf_processor.py  →  embeddings.py  →  in-memory numpy store
+ ├── POST /upload  →  pdf_processor.py  →  embeddings.py  →  Qdrant (cloud or :memory:)
  ├── POST /chat    →  embeddings.py (retrieve)  →  agent.py  →  Mistral API
  ├── GET  /health  →  liveness probe (wakes Render on frontend load)
- └── DELETE /session/:id
+ └── DELETE /session/:id  →  drops Qdrant collection for that session
 ```
 
-The backend is fully stateless per-process: sessions, conversation history, and embeddings all live in Python dicts in RAM. This is intentional for the assessment scope — a production system would use Redis + a persistent vector database.
+Session metadata and conversation history live in Python dicts in RAM (intentional for assessment scope; Redis + a persistent session store would be the production choice). Vector embeddings are stored in Qdrant — persistently in Qdrant Cloud when `QDRANT_URL` is set, or in an in-memory Qdrant instance otherwise.
 
 ---
 
@@ -44,7 +44,7 @@ The backend is fully stateless per-process: sessions, conversation history, and 
 | Frontend | React 18, Vite, Tailwind CSS |
 | Backend | Python 3.11, FastAPI, Uvicorn |
 | Embeddings | `sentence-transformers` — `all-MiniLM-L6-v2` |
-| Vector search | Exact cosine similarity via NumPy (no external vector DB) |
+| Vector database | Qdrant (Cloud or in-memory fallback) |
 | LLM | Mistral `mistral-small-latest` via Mistral API |
 | PDF parsing | PyMuPDF (fitz) |
 | Frontend hosting | Vercel |
@@ -59,29 +59,44 @@ The backend is fully stateless per-process: sessions, conversation history, and 
 ```
 PDF bytes
   → PyMuPDF extracts text per page
-  → chunk_pages() splits into 400-char overlapping windows (80-char overlap)
+  → RecursiveCharacterTextSplitter splits each page independently:
+      separators: \n\n → \n → ". " → " " → char
+      chunk_size=900 chars, chunk_overlap=200 chars
   → sentence-transformers encodes chunks in batches of 8
-  → L2-normalised embeddings stored in memory as numpy array
+  → embeddings + metadata upserted into a per-session Qdrant collection
   → session_id returned to frontend
 ```
 
-Chunking is character-based with overlap to preserve context across chunk boundaries. Each chunk never spans two pages so page citations are always accurate.
+Chunks end at natural linguistic boundaries (paragraph → sentence → word) rather than mid-character. Each page is split independently so a chunk never spans two pages, guaranteeing accurate `[Page N]` citations.
 
 ### 2. Chat
 
 ```
-User question
-  → _expand_query() adds synonyms (e.g. "cache" → "caching batch buffering")
-  → cosine similarity search across session's embeddings → top-10 chunks
-  → chunks injected into user message as [DOCUMENT EXCERPTS] block
+User question + conversation history
+  → _is_contextual_query(): detect pronouns / ordinals / follow-up phrases
+      if contextual → _rewrite_for_retrieval(): lightweight Mistral call
+          resolves "the second point" → "Open/Closed Principle Adapter Pattern"
+  → _extract_keywords(): mine last assistant response for document vocabulary
+      enrich retrieval query with topic keywords from prior answer
+  → _expand_query(): add domain synonyms (e.g. "cache" → "caching batch buffering")
+  → Qdrant cosine similarity search → top-10 candidate chunks
+  → score filter: drop chunks below MIN_RETRIEVAL_SCORE (default 0.20)
+  → 4-level fallback if empty:
+      1. expanded retrieval query (rewritten + enriched + synonyms)
+      2. retrieval query without synonym expansion
+      3. original query + synonyms  (guards against enrichment drift)
+      4. raw original query → if still empty: immediate refusal
+  → original (non-rewritten) query injected with filtered chunks into user message
   → 21-rule system prompt + conversation history sent to Mistral
   → response parsed for [Page N] citations
   → answer + cited_pages + is_refusal returned to frontend
 ```
 
+**Retrieval drift prevention:** the rewritten/enriched query is used *only* for Qdrant vector search. The original user question always goes to the LLM prompt — the model answers what the user actually asked.
+
 ### 3. Vector search
 
-Uses exact numpy dot-product on L2-normalised vectors, which equals cosine similarity. For the collection sizes involved (tens to low hundreds of chunks), this is both faster and more accurate than approximate HNSW search, and saves ~150 MB of RAM compared to ChromaDB.
+Uses Qdrant cosine similarity search. Each upload creates a dedicated Qdrant collection named after the session UUID. When `QDRANT_URL` is configured, vectors are stored remotely in Qdrant Cloud (persistent across Render restarts, zero local RAM overhead). Without `QDRANT_URL`, an in-memory Qdrant instance is used as a fallback — same behaviour as before but with full Qdrant semantics (HNSW indexing, typed payloads).
 
 ---
 
@@ -104,14 +119,21 @@ Key rules enforced on every response:
 - Outer condition priority: in nested logic, the outermost `if` is always stated first
 - Section awareness: clearly labeled document sections (e.g. "Pitfalls", "Forces") must be searched before refusing
 
-**3. Query expansion**
-Before retrieval, the query is expanded with domain synonyms to reduce missed chunks from vocabulary mismatch (e.g. "convert" also retrieves "transform", "translate", "map").
+**3. Conversational query rewriting**
+Follow-up queries ("Explain the second point more simply", "Why does that happen?") cannot be sent directly to the vector store — they lack standalone semantic content. The pipeline resolves them first:
+- `_is_contextual_query()` detects ordinal words (`second`, `last`), pronouns (`it`, `this`, `that`), and follow-up phrases (`"tell me more"`, `"what about"`).
+- `_rewrite_for_retrieval()` makes a lightweight Mistral call (60 tokens, temperature=0) to produce a standalone search query by resolving references using the last 4 conversation turns.
+- `_extract_keywords()` mines the last assistant response for distinctive content words and appends them to the retrieval query, boosting recall on topic-continuation follow-ups.
+- The rewritten query is **only** used for Qdrant search; the original question always reaches the LLM.
 
-**4. Fallback retrieval**
-If the expanded query retrieves nothing, the raw query is tried as a fallback before refusing.
+**4. Query expansion**
+After conversational rewriting, the query is augmented with domain synonyms to reduce vocabulary mismatch (e.g. "pitfalls" also retrieves "drawback limitation disadvantage risk"). Capped at 2 expansion sets to avoid diluting the embedding.
 
-**5. Immediate refusal on zero retrieval**
-If no chunks are retrieved at all, the agent refuses without making an API call.
+**5. 4-level fallback retrieval**
+If the richest retrieval query returns nothing, the pipeline retries: expanded → unexpanded → original + synonyms → raw original.
+
+**6. Immediate refusal on zero retrieval**
+If all four fallback levels return no chunks, the agent refuses without making an API call.
 
 ---
 
@@ -123,27 +145,59 @@ Sending the entire PDF to the LLM on every message would exceed context limits f
 
 ### Chunking strategy
 
-Chunks are **400 characters with 80-character overlap**, split per page. Key decisions:
+Chunks use `RecursiveCharacterTextSplitter` with **900-character target size and 200-character overlap**, split per page. Key decisions:
 
-- **Character-based over token-based** — deterministic, no tokeniser dependency, easier to reason about sizes across different PDF text densities.
+- **`RecursiveCharacterTextSplitter` over manual sliding window** — walks a separator hierarchy (`\n\n` → `\n` → `. ` → ` ` → char) before falling back to raw character splits. In practice, nearly all chunks end at paragraph or sentence boundaries. The old 400-char window frequently cut mid-sentence, producing fragment embeddings that matched queries poorly.
+- **900-char chunk size (~130 words)** — captures a full paragraph as one semantic unit. At 400 chars (old), the embedding model had to represent an incomplete thought; at 900 chars it can represent a complete argument. 10 chunks × 900 chars ≈ 1,400 LLM tokens — well within Mistral's context window even with system prompt and history.
 - **Per-page splitting** — a chunk never crosses a page boundary. This guarantees that the `page` metadata attached to every chunk is always accurate, which directly enables trustworthy `[Page N]` citations.
-- **80-character overlap** — sentences at chunk edges are included in both adjacent chunks, so the retriever does not miss a relevant sentence just because it fell at a boundary.
+- **200-character overlap** — ensures sentences near chunk boundaries appear in both adjacent chunks. At the paragraph-split level the splitter naturally groups complete paragraphs, so overlap mainly benefits dense prose that splits at sentence boundaries.
+- **Character-based length function** — deterministic, no tokeniser dependency, consistent behaviour across different PDF text densities.
+
+**Old vs new comparison:**
+
+| | Old (400-char window) | New (RCS 900-char) |
+|---|---|---|
+| Split point | Mid-character (arbitrary) | Paragraph → sentence → word |
+| Typical chunk | Fragment of a paragraph | Complete paragraph |
+| Overlap | 80 chars (may cut mid-word) | 200 chars at sentence boundaries |
+| Embedding quality | Incomplete semantic unit | Complete semantic unit |
+| Citations | Accurate (per-page) | Accurate (per-page, unchanged) |
 
 ### Embedding model
 
 `all-MiniLM-L6-v2` was chosen because:
-- 90 MB on disk — fits comfortably within Render's free-tier memory budget alongside FastAPI and the numpy store
-- 384-dimensional output — small enough that exact similarity search over hundreds of chunks is faster than HNSW approximation
+- 90 MB on disk — fits comfortably within Render's free-tier memory budget alongside FastAPI
+- 384-dimensional output — a good balance between embedding quality and storage/compute cost
 - Strong semantic quality for English text retrieval tasks despite its size
 
-### NumPy vector store vs ChromaDB
+### Retrieval score filtering
 
-The original design used ChromaDB. It was replaced with a plain Python dict + NumPy for two concrete reasons:
+After Qdrant returns the top-k candidates, chunks below the minimum cosine similarity threshold are dropped before they reach the LLM. This prevents low-quality, weakly-related context from entering the prompt and confusing the model.
 
-1. **Memory.** ChromaDB pulls in ONNX runtime, SQLite, and a C++ HNSW extension. Combined with PyTorch, this pushed the process over Render's 512 MB free-tier limit when a second PDF was uploaded. The NumPy store uses ~70 KB per session (46 chunks × 384 dims × float32) — effectively zero overhead.
-2. **Accuracy.** HNSW is an approximate algorithm designed for millions of vectors. For collections of 50–500 chunks, exact cosine similarity is both more accurate (no approximation error) and faster.
+**Qdrant scoring:** `Distance.COSINE` returns cosine similarity (dot product of L2-normalised vectors), range −1 to +1. For sentence-transformer embeddings on real text, practical scores fall in [0, 0.9].
 
-Trade-off accepted: embeddings are in-memory only and lost on process restart. For the assessment scope this is acceptable — a production deployment would persist to a vector database (Pinecone, pgvector, Weaviate).
+| Score range | Meaning | Action |
+|---|---|---|
+| > 0.50 | Directly relevant | Included |
+| 0.20–0.50 | Related / weak association | Included |
+| < 0.20 | Vocabulary overlap only | **Filtered out** |
+
+**Default threshold: 0.20** — conservative enough that genuinely relevant queries always pass, but removes the truly unrelated candidates that would only add noise. Configurable via `MIN_RETRIEVAL_SCORE` env var.
+
+If filtering removes all candidates, the fallback path in `agent.py` retries with the raw (unexpanded) query. If that also returns nothing, the agent issues the standard refusal sentence rather than making an API call.
+
+### Vector database: Qdrant
+
+The system uses Qdrant as the vector database. The connection mode is chosen at startup from environment variables:
+
+- **`QDRANT_URL` + `QDRANT_API_KEY` set (Qdrant Cloud)** — vectors are stored remotely and persist across Render restarts. The Render process holds only the embedding model (~90 MB); per-session RAM overhead drops to zero.
+- **Neither set (in-memory fallback)** — Qdrant runs in-process using `:memory:` mode. Same ephemeral behaviour as the previous NumPy store, but with full Qdrant semantics: HNSW indexing, structured payloads, and proper cosine distance search.
+
+Each PDF upload creates a dedicated Qdrant collection named after the session UUID. This gives natural isolation, makes deletions atomic (one `delete_collection` call), and avoids the need for per-query metadata filters. The collection is dropped automatically when the user removes the document.
+
+**Why Qdrant over the previous NumPy store:** the NumPy approach required manual L2 normalisation + matrix dot-product on every query and held all vectors in process RAM. Qdrant moves storage and search to a purpose-built engine with proper HNSW indexing, typed payload storage, and a well-defined API. With Qdrant Cloud the RAM savings on Render are material: a session with 100 chunks × 384 dims × 4 bytes = 154 KB is now stored remotely rather than in the Python process.
+
+**Why Qdrant over the previous ChromaDB attempt:** ChromaDB's Python package pulls in ONNX runtime, SQLite, and a C++ HNSW extension — enough overhead to push the Render free tier process over 512 MB with two concurrent sessions. `qdrant-client` is a lightweight REST/gRPC client with no heavy native extensions; the actual vector work happens in the Qdrant engine (remote or in-process via the lightweight embedded mode).
 
 ### System prompt design
 
@@ -161,21 +215,36 @@ The prompt has grown to 21 explicit rules through iterative testing against real
 
 The rules are injected as a static system prompt, which means the same guardrails apply to every turn of every conversation, regardless of what the user asks.
 
+### Conversational query rewriting
+
+Sending a follow-up like "Explain the second point more simply" directly to the vector store returns zero relevant chunks — the embedding has no semantic content without the prior context. The pipeline resolves this before retrieval:
+
+1. `_is_contextual_query()` checks for ordinal words (`second`, `last`, `previous`), pronoun words (`it`, `this`, `that`, `they`), follow-up phrases (`"tell me more"`, `"what about"`, `"more simply"`), or queries with fewer than 4 words.
+2. If contextual, `_rewrite_for_retrieval()` calls Mistral with `max_tokens=60`, `temperature=0` and the last 4 history turns, producing a standalone search query. Example: `"Explain the second point more simply"` → `"Open/Closed Principle Adapter Pattern"`.
+3. `_extract_keywords()` mines the last assistant response for content words (≥4 chars, non-stopword) and appends the top 10 to the retrieval query. This boosts recall even for non-contextual follow-ups that stay on the same topic.
+
+The rewritten query is only used for Qdrant search. The original question always goes to the LLM prompt.
+
 ### Query expansion
 
-Before retrieval, the query is augmented with a synonym set if a known keyword is detected (e.g. "cache" → adds "caching batch buffering"). This compensates for vocabulary mismatch between how the user phrases a question and how the PDF author wrote the answer. Expansion is additive — the original query is always preserved — and only one expansion fires per query (first match wins) to avoid diluting the embedding.
+After conversational rewriting, the query is augmented with domain synonyms if a known keyword is detected (e.g. `"pitfalls"` → adds `"problem issue drawback limitation disadvantage risk"`). This compensates for vocabulary mismatch between how the user phrases a question and how the PDF author wrote the answer. At most 2 expansion sets fire per query, and the synonym sets are deduplicated to avoid repetition when multiple related keywords appear in the same query.
 
 ### Multi-turn conversation
 
-Conversation history is maintained per session in a Python list. On each `/chat` call, the full history is prepended before the current user turn in the API request. Importantly, context chunks are re-retrieved fresh on every turn rather than cached — this means follow-up questions retrieve different chunks if they ask about a different part of the document, rather than being locked to the chunks from turn 1.
+Conversation history is maintained per session in a Python list. On each `/chat` call, the full history is prepended before the current user turn in the API request. Context chunks are re-retrieved fresh on every turn — follow-up questions retrieve different chunks if they ask about a different part of the document, rather than being locked to the chunks from turn 1. The conversational rewriting layer ensures that follow-up queries which reference prior answers still retrieve the right chunks from the vector store.
 
 ### Trade-offs summary
 
 | Decision | Chosen | Alternative | Reason for choice |
 |---|---|---|---|
-| Vector store | NumPy in-memory | ChromaDB, Pinecone | Memory budget, exact accuracy for small N |
-| Chunking unit | Character | Token | Deterministic, no tokeniser dependency |
-| Retrieval k | 10 | 5, 20 | Balance between context coverage and prompt size |
+| Vector database | Qdrant (Cloud or :memory:) | ChromaDB, Pinecone | Lightweight client, persistent cloud option, free tier |
+| Collection strategy | One collection per session | Shared + filter | Simpler isolation, atomic deletion, no query filter overhead |
+| Chunking | `RecursiveCharacterTextSplitter` 900/200 | Manual char window 400/80 | Paragraph/sentence boundaries → better embeddings |
+| Retrieval k | 10 candidates → score filter | Fixed 5 or 10 | Oversample then discard noise rather than hard-cap |
+| Score threshold | 0.20 (configurable) | No threshold | Drops vocabulary-overlap-only chunks; configurable per env |
+| Conversational rewrite | Lightweight Mistral call (60 tokens) | Off / HyDE / local model | Reuses existing API key; no new dependency; 4-turn window bounded |
+| Retrieval drift guard | Original query always goes to LLM | Rewritten query to LLM | Ensures the model answers what the user asked, not the search query |
+| Fallback chain | 4 levels (expanded → unexpanded → original+syn → raw) | Single attempt | Never silently fails; each level reduces specificity gracefully |
 | Session state | In-memory dict | Redis | Assessment scope — Redis adds ops overhead |
 | LLM | Mistral small | GPT-4o, Claude | Cost-effective, strong instruction following |
 | Prompt style | Static system prompt | Dynamic per-query | Simpler, consistent guardrails across all turns |
@@ -263,6 +332,9 @@ Frontend runs at `http://localhost:5173`.
 | Variable | Default | Description |
 |---|---|---|
 | `MISTRAL_API_KEY` | — | **Required.** Mistral API key |
+| `QDRANT_URL` | *(blank)* | Qdrant Cloud cluster URL. If blank, falls back to in-memory Qdrant. |
+| `QDRANT_API_KEY` | *(blank)* | Qdrant Cloud API key. Required when `QDRANT_URL` is set. |
+| `MIN_RETRIEVAL_SCORE` | `0.20` | Minimum cosine similarity score for a chunk to reach the LLM. |
 | `MAX_PDF_SIZE_MB` | `20` | Reject uploads larger than this |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,...` | CORS allowed origins |
 
@@ -283,7 +355,10 @@ Frontend runs at `http://localhost:5173`.
 3. Set **Root Directory** to `backend`.
 4. Set **Build Command:** `pip install -r requirements.txt`
 5. Set **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-6. Add environment variable: `MISTRAL_API_KEY=<your key>`
+6. Add environment variables:
+   - `MISTRAL_API_KEY=<your Mistral key>`
+   - `QDRANT_URL=<your Qdrant Cloud cluster URL>`
+   - `QDRANT_API_KEY=<your Qdrant Cloud API key>`
 7. Deploy.
 
 The frontend pings `/health` on load to wake the free-tier instance before the user's first upload.

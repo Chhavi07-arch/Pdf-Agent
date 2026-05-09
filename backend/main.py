@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agent import get_answer, is_refusal
-from embeddings import delete_session as _chroma_delete
+from embeddings import delete_session as _delete_session
 from embeddings import embed_and_store
 from pdf_processor import parse_and_chunk
 
@@ -215,7 +215,7 @@ async def chat(request: ChatRequest):
     """
     Answer a question grounded strictly in the uploaded PDF.
 
-    Retrieves relevant chunks from ChromaDB, passes them to Claude with the
+    Retrieves relevant chunks from Qdrant, passes them to Mistral with the
     anti-hallucination system prompt, and returns a cited answer.
 
     Conversation history for the session is maintained in-memory so the
@@ -291,10 +291,10 @@ async def chat(request: ChatRequest):
 @app.delete("/session/{session_id}", summary="Delete a session")
 async def delete_session(session_id: str):
     """
-    Remove a session's vector data from ChromaDB and clear its history.
+    Remove a session's vector data from Qdrant and clear its history.
 
-    Safe to call after the user is done with a document. Frees ChromaDB
-    memory and removes the conversation log.
+    Safe to call after the user is done with a document. Drops the Qdrant
+    collection and removes the conversation log.
 
     Raises:
         404: session_id not found.
@@ -305,8 +305,8 @@ async def delete_session(session_id: str):
             detail=f"Session '{session_id}' not found.",
         )
 
-    # Delete ChromaDB collection — I/O, run in thread pool
-    await asyncio.to_thread(_chroma_delete, session_id)
+    # Drop Qdrant collection — network I/O, run in thread pool
+    await asyncio.to_thread(_delete_session, session_id)
 
     sessions.pop(session_id, None)
     histories.pop(session_id, None)

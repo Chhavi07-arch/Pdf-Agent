@@ -1,6 +1,4 @@
 backend/.env
-backend/chroma_data/
-backend/chroma_db/
 backend/__pycache__/
 backend/*.pyc
 frontend/node_modules/
@@ -11,5 +9,11 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+# Legacy vector store directories (no longer used)
 chroma_data/
 chroma_db/
+backend/chroma_data/
+backend/chroma_db/
+# Qdrant local storage (if switching from :memory: to path-based in future)
+backend/qdrant_data/
+qdrant_data/
