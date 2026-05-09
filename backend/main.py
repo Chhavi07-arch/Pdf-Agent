@@ -23,6 +23,7 @@ from agent import get_answer, is_refusal
 from embeddings import delete_session as _delete_session
 from embeddings import embed_and_store
 from pdf_processor import parse_and_chunk
+from summarizer import format_summary_answer, generate_doc_summary, is_document_level_query
 
 # Load .env before any os.getenv calls below
 load_dotenv()
@@ -189,11 +190,26 @@ async def upload_pdf(file: UploadFile = File(...)):
     # --- Embed and store — CPU-bound (model inference), run in thread pool ---
     await asyncio.to_thread(embed_and_store, chunks, session_id)
 
+    # --- Generate document summary for global query answering ---
+    # Uses ~5 representative chunks (≤ 4 000 chars ≈ 1 000 tokens).
+    # Failures are non-fatal: doc_summary is stored as None and document-level
+    # queries fall back gracefully to vector retrieval.
+    api_key = os.getenv("MISTRAL_API_KEY", "")
+    print(f"[main] Generating document summary for '{filename}'…")
+    doc_summary = await asyncio.to_thread(
+        generate_doc_summary, chunks, filename, api_key
+    )
+    if doc_summary:
+        print(f"[main] Document summary stored | type={doc_summary.get('document_type')!r}")
+    else:
+        print("[main] Document summary unavailable — document-level queries will use vector retrieval.")
+
     # --- Persist session metadata ---
     sessions[session_id] = {
-        "filename": filename,
+        "filename":    filename,
         "chunk_count": len(chunks),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at":  datetime.now(timezone.utc).isoformat(),
+        "doc_summary": doc_summary,   # None if generation failed
     }
     histories[session_id] = []
 
@@ -203,10 +219,10 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
 
     return {
-        "session_id": session_id,
-        "filename": filename,
+        "session_id":  session_id,
+        "filename":    filename,
         "chunk_count": len(chunks),
-        "message": "PDF uploaded and indexed successfully. Ready to chat.",
+        "message":     "PDF uploaded and indexed successfully. Ready to chat.",
     }
 
 
@@ -245,13 +261,48 @@ async def chat(request: ChatRequest):
         )
 
     history = histories[request.session_id]
+    session_meta = sessions[request.session_id]
 
     print(
         f"[main] Chat request | session={request.session_id} "
         f"| history_turns={len(history)} | query={message!r:.80}"
     )
 
-    # --- Get grounded answer — I/O + CPU-bound, run in thread pool ---
+    # --- Document-level query fast path ---
+    # If the query asks about the document as a whole (e.g. "What is this about?",
+    # "Summarize this document", "What topics are covered?") AND a summary was
+    # generated at upload time, answer directly from summary metadata —
+    # no vector retrieval, no Mistral API call, instant response.
+    doc_summary = session_meta.get("doc_summary")
+    if is_document_level_query(message) and doc_summary:
+        print(
+            f"[main] ROUTE: document-level summary | "
+            f"skipping vector retrieval for session={request.session_id}"
+        )
+        answer = format_summary_answer(message, doc_summary, session_meta["filename"])
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": answer})
+        print(
+            f"[main] Chat answered | session={request.session_id} "
+            f"| source=doc_summary | is_refusal=False"
+        )
+        return {
+            "answer":      answer,
+            "cited_pages": [],
+            "chunks_used": 0,
+            "is_refusal":  False,
+            "session_id":  request.session_id,
+        }
+
+    # If doc_summary is None (generation failed at upload) and the query is
+    # document-level, fall through to vector retrieval — degraded but functional.
+    if is_document_level_query(message) and not doc_summary:
+        print(
+            f"[main] ROUTE: document-level query but no summary — "
+            f"falling back to vector retrieval."
+        )
+
+    # --- Normal vector retrieval path ---
     # Pass a shallow copy of history so get_answer cannot mutate our list.
     try:
         result = await asyncio.to_thread(
@@ -261,30 +312,28 @@ async def chat(request: ChatRequest):
             list(history),
         )
     except Exception as exc:
-        # Surface API errors clearly rather than returning a 500 with no context
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"LLM call failed: {exc}",
         ) from exc
 
     # --- Update conversation history ---
-    # Store the raw user query (not the context-injected version) so history
-    # stays concise; each new turn always retrieves fresh context anyway.
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": result["answer"]})
 
     refusal = is_refusal(result["answer"])
     print(
         f"[main] Chat answered | session={request.session_id} "
-        f"| is_refusal={refusal} | cited_pages={result['cited_pages']}"
+        f"| source=vector_retrieval | is_refusal={refusal} "
+        f"| cited_pages={result['cited_pages']}"
     )
 
     return {
-        "answer": result["answer"],
+        "answer":      result["answer"],
         "cited_pages": result["cited_pages"],
         "chunks_used": result["chunks_used"],
-        "is_refusal": refusal,
-        "session_id": request.session_id,
+        "is_refusal":  refusal,
+        "session_id":  request.session_id,
     }
 
 
