@@ -71,9 +71,9 @@ export default function MessageBubble({ role, content, citedPages, isRefusal, is
   if (isRefusal) {
     wrapperClass = ''
     wrapperStyle = {
-      background: 'rgba(120, 53, 15, 0.4)',
-      borderLeft: '4px solid #f59e0b',
-      border: '1px solid rgba(245, 158, 11, 0.3)',
+      background: 'rgba(30, 27, 75, 0.7)',
+      borderLeft: '3px solid rgba(100, 116, 139, 0.5)',
+      border: '1px solid rgba(100, 116, 139, 0.2)',
     }
   }
   if (isError) {
@@ -100,9 +100,9 @@ export default function MessageBubble({ role, content, citedPages, isRefusal, is
 
           {/* Refusal label */}
           {isRefusal && (
-            <p className="text-xs font-semibold mb-1.5 flex items-center gap-1" style={{color: '#fbbf24'}}>
-              <span style={{color: '#fbbf24'}}><WarningIcon className="w-3 h-3" /></span>
-              Not in document
+            <p className="text-xs font-medium mb-1.5 flex items-center gap-1" style={{color: '#94a3b8'}}>
+              <span style={{color: '#94a3b8'}}><WarningIcon className="w-3 h-3" /></span>
+              Not found in document
             </p>
           )}
 

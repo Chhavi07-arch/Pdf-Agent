@@ -704,13 +704,63 @@ def _rewrite_for_retrieval(query: str, history: List[dict]) -> str:
         return query
 
 
+def _normalize_retrieval_query(query: str) -> str:
+    """
+    Normalize a retrieval query to improve embedding recall without semantic drift.
+
+    Transformations applied in order:
+      1. Strip meta-question prefixes — "what is meant by", "define", etc.
+         These words describe the question format, not the concept being searched.
+      2. Replace "/" with space — "shape/semantics" tokenizes as three tokens
+         including "/"; replacing with space gives a cleaner two-concept phrase.
+      3. Strip quotation marks — users often quote terms ("adapter pattern")
+         that should be searched without the quote characters.
+      4. Collapse multiple spaces introduced by the above steps.
+
+    Args:
+        query: The user's raw query string.
+
+    Returns:
+        Normalized query string (may be identical to input if no rules fire).
+    """
+    q = query.strip()
+    lower_q = q.lower()
+
+    # Strip meta-question prefixes
+    for prefix in (
+        "what is meant by ",
+        "what do you mean by ",
+        "what does it mean by ",
+        "what is the meaning of ",
+        "define ",
+    ):
+        if lower_q.startswith(prefix):
+            q = q[len(prefix):]
+            lower_q = q.lower()
+            break
+
+    # Slashes → spaces ("shape/semantics" → "shape semantics")
+    q = q.replace("/", " ")
+
+    # Strip ASCII and Unicode quotation marks
+    for ch in ('"', "'", "“", "”", "‘", "’"):
+        q = q.replace(ch, "")
+
+    # Collapse whitespace
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
 def _build_retrieval_query(query: str, history: List[dict]) -> str:
     """
     Build the best standalone retrieval query for a given user turn.
 
     Strategy (applied in order, each step builds on the previous):
 
-      1. No history → return query unchanged (first turn is always standalone).
+      0. Normalize the query — strip meta-prefixes, replace "/" with space,
+         remove quotation marks.  Applied even on the first turn.
+
+      1. No history → return normalized query unchanged (first turn is standalone).
 
       2. Contextual query (pronouns / ordinals / very short) AND history exists:
          → LLM rewrite to resolve references into explicit topic terms.
@@ -730,10 +780,15 @@ def _build_retrieval_query(query: str, history: List[dict]) -> str:
     Returns:
         An enriched retrieval query string.
     """
-    if not history:
-        return query  # first turn — standalone, nothing to enrich from
+    # ── Step 0: Normalize ────────────────────────────────────────────────────
+    normalized = _normalize_retrieval_query(query)
+    if normalized != query:
+        print(f"[agent] Normalization: {query!r}  →  {normalized!r}")
 
-    retrieval_query = query
+    if not history:
+        return normalized  # first turn — standalone, nothing to enrich from
+
+    retrieval_query = normalized
     steps_applied: List[str] = []
 
     # ── Step A: LLM rewrite for contextual queries ──────────────────────────
@@ -782,20 +837,38 @@ def _build_retrieval_query(query: str, history: List[dict]) -> str:
     return retrieval_query
 
 
+# Catches LLM-paraphrased refusals that don't use the exact REFUSAL_PREFIX wording.
+# Examples matched:
+#   "I'm sorry, but I cannot find information about…"
+#   "I am sorry, but the document does not contain…"
+#   "I'm sorry, but there is no information in this document…"
+# The pattern is intentionally narrow (requires "I'm/I am sorry, but") to avoid
+# flagging partial answers that legitimately start with apology-adjacent phrases.
+_REFUSAL_RE = re.compile(
+    r"^I(?:'m| am) sorry[,.]?\s+but\s+(?:I |the |this |there )",
+    re.IGNORECASE,
+)
+
+
 def is_refusal(answer: str) -> bool:
     """
-    Return True if the answer is a standard out-of-scope refusal.
+    Return True if the answer is an out-of-scope refusal.
 
-    Matches on REFUSAL_PREFIX so main.py can set a flag in the API response
-    without re-implementing the detection logic.
+    Checks two patterns:
+      1. Exact REFUSAL_PREFIX — the prescribed Rule-3 wording from the system prompt.
+      2. _REFUSAL_RE regex  — catches LLM-paraphrased variants that convey the same
+         intent but don't use the exact prescribed wording (e.g. "I'm sorry, but I
+         cannot find information about…" vs the canonical "I'm sorry, but the uploaded
+         document does not contain information about…").
 
     Args:
         answer: The answer string returned by get_answer().
 
     Returns:
-        True if the answer begins with the standard refusal prefix.
+        True if the answer is a refusal by either pattern.
     """
-    return answer.strip().startswith(REFUSAL_PREFIX)
+    stripped = answer.strip()
+    return stripped.startswith(REFUSAL_PREFIX) or bool(_REFUSAL_RE.match(stripped))
 
 
 def get_answer(

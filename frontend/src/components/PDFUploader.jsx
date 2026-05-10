@@ -1,6 +1,13 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const MAX_FILE_MB = 20
+
+const UPLOAD_STAGES = [
+  'Parsing pages…',
+  'Creating embeddings…',
+  'Indexing content…',
+  'Almost ready…',
+]
 
 export default function PDFUploader({
   apiBase,
@@ -14,6 +21,15 @@ export default function PDFUploader({
   const [phase, setPhase]           = useState('idle')  // 'idle' | 'uploading' | 'error'
   const [errorMsg, setErrorMsg]     = useState('')
   const [dragActive, setDragActive] = useState(false)
+  const [stageIdx, setStageIdx]     = useState(0)
+
+  useEffect(() => {
+    if (phase !== 'uploading') return
+    const timer = setInterval(() => {
+      setStageIdx(i => Math.min(i + 1, UPLOAD_STAGES.length - 1))
+    }, 6000)
+    return () => clearInterval(timer)
+  }, [phase])
 
   const fileInputRef = useRef(null)
   const dragCounter  = useRef(0)
@@ -55,6 +71,7 @@ export default function PDFUploader({
 
   async function uploadFile(file) {
     setPhase('uploading')
+    setStageIdx(0)
     setErrorMsg('')
 
     const form = new FormData()
@@ -114,7 +131,7 @@ export default function PDFUploader({
           >
             <Spinner />
             <p className="text-sm font-medium" style={{color: '#a78bfa'}}>Processing document…</p>
-            <p className="text-xs" style={{color: '#64748b'}}>Parsing and indexing pages</p>
+            <p className="text-xs" style={{color: '#64748b'}}>{UPLOAD_STAGES[stageIdx]}</p>
           </div>
         ) : (
           <>
