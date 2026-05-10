@@ -27,10 +27,13 @@ React + Vite (Vercel)
  │  VITE_API_BASE_URL
  ▼
 FastAPI (Render)
- ├── POST /upload  →  pdf_processor.py  →  embeddings.py  →  Qdrant (cloud or :memory:)
- ├── POST /chat    →  embeddings.py (retrieve)  →  agent.py  →  Mistral API
- ├── GET  /health  →  liveness probe (wakes Render on frontend load)
- └── DELETE /session/:id  →  drops Qdrant collection for that session
+ ├── POST /upload  →  pdf_processor.py  →  embeddings.py  →  Qdrant
+ │                    └── [background task] summarizer.py  →  Mistral API (doc summary)
+ ├── POST /chat    →  summarizer.py (doc-level fast path, if summary ready)
+ │                    └── embeddings.py (retrieve)  →  agent.py  →  Mistral API
+ ├── GET  /health        →  liveness probe (wakes Render on frontend load)
+ ├── GET  /health/debug  →  model/Qdrant status + live connectivity probe
+ └── DELETE /session/:id →  drops Qdrant collection for that session
 ```
 
 Session metadata and conversation history live in Python dicts in RAM (intentional for assessment scope; Redis + a persistent session store would be the production choice). Vector embeddings are stored in Qdrant — persistently in Qdrant Cloud when `QDRANT_URL` is set, or in an in-memory Qdrant instance otherwise.
@@ -64,15 +67,28 @@ PDF bytes
       chunk_size=900 chars, chunk_overlap=200 chars
   → sentence-transformers encodes chunks in batches of 8
   → embeddings + metadata upserted into a per-session Qdrant collection
-  → session_id returned to frontend
+  → 201 returned to frontend  ← upload is complete from the client's view
+  → [BackgroundTask] summarizer.py calls Mistral to generate a structured
+      doc summary (title, topics, document type, entities) from ~6 representative
+      chunks. Stored in session metadata for the document-level fast path.
 ```
 
 Chunks end at natural linguistic boundaries (paragraph → sentence → word) rather than mid-character. Each page is split independently so a chunk never spans two pages, guaranteeing accurate `[Page N]` citations.
+
+The summary generation runs **after** the 201 is sent (FastAPI `BackgroundTasks`) so it never adds latency to the upload response. On startup, the embedding model and Qdrant client are preloaded via a warmup call so the first upload does not bear the cold-start penalty.
 
 ### 2. Chat
 
 ```
 User question + conversation history
+  → Document-level fast path (if query matches global patterns AND doc summary is ready):
+      is_document_level_query(): detect "summarize this", "what is this about?", etc.
+      format_summary_answer(): compose response from stored summary — no RAG call
+  ↓ (all other queries go through RAG below)
+  → _normalize_retrieval_query(): clean up retrieval query before vector search
+      strip meta-prefixes ("what is meant by", "define")
+      replace "/" with space ("shape/semantics" → "shape semantics")
+      strip quotation marks
   → _is_contextual_query(): detect pronouns / ordinals / follow-up phrases
       if contextual → _rewrite_for_retrieval(): lightweight Mistral call
           resolves "the second point" → "Open/Closed Principle Adapter Pattern"
@@ -88,7 +104,7 @@ User question + conversation history
       4. raw original query → if still empty: immediate refusal
   → original (non-rewritten) query injected with filtered chunks into user message
   → 21-rule system prompt + conversation history sent to Mistral
-  → response parsed for [Page N] citations
+  → response parsed for [Page N] citations; hallucinated page numbers stripped
   → answer + cited_pages + is_refusal returned to frontend
 ```
 
@@ -119,21 +135,27 @@ Key rules enforced on every response:
 - Outer condition priority: in nested logic, the outermost `if` is always stated first
 - Section awareness: clearly labeled document sections (e.g. "Pitfalls", "Forces") must be searched before refusing
 
-**3. Conversational query rewriting**
+**3. Citation validation**
+After the LLM responds, every `[Page N]` citation is cross-checked against the set of pages actually present in the retrieved chunks. Hallucinated page numbers (pages the model was never shown) are stripped from the returned `cited_pages` list before the response reaches the frontend.
+
+**4. Retrieval query normalization**
+Before any vector search, the query is normalized: meta-prefixes ("what is meant by", "define") are stripped, slashes are replaced with spaces (`"shape/semantics"` → `"shape semantics"`), and quotation marks are removed. This ensures unusual punctuation or phrasing doesn't degrade embedding similarity compared to how the PDF author wrote the same concept.
+
+**5. Conversational query rewriting**
 Follow-up queries ("Explain the second point more simply", "Why does that happen?") cannot be sent directly to the vector store — they lack standalone semantic content. The pipeline resolves them first:
-- `_is_contextual_query()` detects ordinal words (`second`, `last`), pronouns (`it`, `this`, `that`), and follow-up phrases (`"tell me more"`, `"what about"`).
+- `_is_contextual_query()` detects ordinal words (`second`, `last`), pronouns (`it`, `this`, `that`), and unambiguous follow-up phrases (`"tell me more"`, `"why is that"`).
 - `_rewrite_for_retrieval()` makes a lightweight Mistral call (60 tokens, temperature=0) to produce a standalone search query by resolving references using the last 4 conversation turns.
 - `_extract_keywords()` mines the last assistant response for distinctive content words and appends them to the retrieval query, boosting recall on topic-continuation follow-ups.
 - The rewritten query is **only** used for Qdrant search; the original question always reaches the LLM.
 
-**4. Query expansion**
+**6. Query expansion**
 After conversational rewriting, the query is augmented with domain synonyms to reduce vocabulary mismatch (e.g. "pitfalls" also retrieves "drawback limitation disadvantage risk"). Capped at 2 expansion sets to avoid diluting the embedding.
 
-**5. 4-level fallback retrieval**
+**7. 4-level fallback retrieval**
 If the richest retrieval query returns nothing, the pipeline retries: expanded → unexpanded → original + synonyms → raw original.
 
-**6. Immediate refusal on zero retrieval**
-If all four fallback levels return no chunks, the agent refuses without making an API call.
+**8. Immediate refusal on zero retrieval**
+If all four fallback levels return no chunks, the agent refuses without making an API call. The `is_refusal()` function also catches LLM-paraphrased refusals via a regex pattern, so even non-canonical refusal wording is correctly flagged in the API response.
 
 ---
 
@@ -219,7 +241,7 @@ The rules are injected as a static system prompt, which means the same guardrail
 
 Sending a follow-up like "Explain the second point more simply" directly to the vector store returns zero relevant chunks — the embedding has no semantic content without the prior context. The pipeline resolves this before retrieval:
 
-1. `_is_contextual_query()` checks for ordinal words (`second`, `last`, `previous`), pronoun words (`it`, `this`, `that`, `they`), follow-up phrases (`"tell me more"`, `"what about"`, `"more simply"`), or queries with fewer than 4 words.
+1. `_is_contextual_query()` checks for ordinal words (`second`, `last`, `previous`), pronoun words (`it`, `this`, `that`, `they`), unambiguous follow-up phrases (`"tell me more"`, `"why is that"`, `"elaborate"`), or queries with 2 or fewer words. Broad phrases like `"what about"` are intentionally excluded — they are equally likely to introduce a new standalone topic.
 2. If contextual, `_rewrite_for_retrieval()` calls Mistral with `max_tokens=60`, `temperature=0` and the last 4 history turns, producing a standalone search query. Example: `"Explain the second point more simply"` → `"Open/Closed Principle Adapter Pattern"`.
 3. `_extract_keywords()` mines the last assistant response for content words (≥4 chars, non-stopword) and appends the top 10 to the retrieval query. This boosts recall even for non-contextual follow-ups that stay on the same topic.
 
@@ -233,6 +255,17 @@ After conversational rewriting, the query is augmented with domain synonyms if a
 
 Conversation history is maintained per session in a Python list. On each `/chat` call, the full history is prepended before the current user turn in the API request. Context chunks are re-retrieved fresh on every turn — follow-up questions retrieve different chunks if they ask about a different part of the document, rather than being locked to the chunks from turn 1. The conversational rewriting layer ensures that follow-up queries which reference prior answers still retrieve the right chunks from the vector store.
 
+### Document-level summary memory
+
+At upload time, `summarizer.py` generates a lightweight structured summary of the document from ≤6 representative chunks (first 2 chunks for title/intro, heading-bearing chunks for structure, evenly-spaced fallback). The result — title, 2–4 sentence description, topics, document type, entities — is stored in the session metadata dict.
+
+On every `/chat` call, `is_document_level_query()` checks whether the question targets the document as a whole (`"What is this document about?"`, `"Summarize the document"`, `"What topics are covered?"`). If yes and the summary is available, `format_summary_answer()` composes a direct response from the stored metadata — bypassing vector retrieval entirely.
+
+**Key properties:**
+- Summary generation runs as a FastAPI `BackgroundTask` — the 201 upload response is sent first, so upload latency is unaffected even if the Mistral summary call takes several seconds.
+- If the background task has not completed when the first document-level query arrives, `is_document_level_query()` falls through to the normal RAG path — degraded but correct.
+- Any failure in `generate_doc_summary()` returns `None` silently — the upload still succeeds.
+
 ### Trade-offs summary
 
 | Decision | Chosen | Alternative | Reason for choice |
@@ -244,6 +277,8 @@ Conversation history is maintained per session in a Python list. On each `/chat`
 | Score threshold | 0.20 (configurable) | No threshold | Drops vocabulary-overlap-only chunks; configurable per env |
 | Conversational rewrite | Lightweight Mistral call (60 tokens) | Off / HyDE / local model | Reuses existing API key; no new dependency; 4-turn window bounded |
 | Retrieval drift guard | Original query always goes to LLM | Rewritten query to LLM | Ensures the model answers what the user asked, not the search query |
+| Query normalization | Pre-search text cleanup (no API call) | None | Free fix for slash/quote/prefix issues that degrade embedding quality |
+| Doc-level fast path | Pre-generated summary (BackgroundTask) | Full RAG on every query | Instant answers for overview queries; no extra latency on upload |
 | Fallback chain | 4 levels (expanded → unexpanded → original+syn → raw) | Single attempt | Never silently fails; each level reduces specificity gracefully |
 | Session state | In-memory dict | Redis | Assessment scope — Redis adds ops overhead |
 | LLM | Mistral small | GPT-4o, Claude | Cost-effective, strong instruction following |
@@ -256,20 +291,21 @@ Conversation history is maintained per session in a Python list. On each `/chat`
 ```
 pdf-agent/
 ├── backend/
-│   ├── main.py            # FastAPI app — routes, validation, session state
-│   ├── agent.py           # Prompt construction, query expansion, Mistral call
-│   ├── embeddings.py      # Encoding, numpy vector store, cosine retrieval
-│   ├── pdf_processor.py   # PyMuPDF parsing, character-based chunking
+│   ├── main.py            # FastAPI app — routes, validation, session state, background tasks
+│   ├── agent.py           # Query normalisation, rewriting, expansion, Mistral call, citations
+│   ├── embeddings.py      # sentence-transformers encoding, Qdrant vector store + retrieval
+│   ├── summarizer.py      # Upload-time doc summary generation and global query routing
+│   ├── pdf_processor.py   # PyMuPDF parsing, RecursiveCharacterTextSplitter chunking
 │   ├── requirements.txt
-│   ├── .python-version    # 3.11.9
+│   ├── .python-version    # 3.11
 │   └── .env.example
 └── frontend/
     ├── src/
     │   ├── App.jsx                      # Session state, send/upload handlers
     │   └── components/
-    │       ├── PDFUploader.jsx          # Drop zone, upload list, session switching
+    │       ├── PDFUploader.jsx          # Drop zone, upload list, session switching, cycling stage text
     │       ├── ChatWindow.jsx           # Message scroll, input bar, typing indicator
-    │       └── MessageBubble.jsx        # User/assistant bubbles, citation chips
+    │       └── MessageBubble.jsx        # User/assistant bubbles, citation chips, refusal card
     ├── index.html
     ├── package.json
     └── vite.config.js
@@ -415,8 +451,22 @@ Ask a question about an uploaded PDF.
 ### `GET /health`
 Liveness probe. Returns `{"status": "ok", "active_sessions": N}`.
 
+### `GET /health/debug`
+Detailed system status — returns initialization state of the embedding model and Qdrant client, plus a live Qdrant connectivity probe. Useful for diagnosing production issues without tailing Render logs.
+
+```json
+{
+  "status": "ok",
+  "embedding_model": "loaded",
+  "qdrant_client": "initialized",
+  "qdrant_ping": true,
+  "mistral_key": "set",
+  "active_sessions": 2
+}
+```
+
 ### `DELETE /session/:id`
-Remove a session and free its in-memory embeddings.
+Remove a session, drop its Qdrant collection, and free its in-memory state.
 
 ---
 
