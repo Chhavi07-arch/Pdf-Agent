@@ -22,6 +22,9 @@ numpy==1.26.4
 # Vector database
 qdrant-client==1.12.1
 
+# Keyword search for hybrid retrieval (BM25 fused with semantic search)
+rank-bm25==0.2.2
+
 # Text splitting (used in chunking layer — installed now, wired in next step)
 langchain-text-splitters==0.3.8
 

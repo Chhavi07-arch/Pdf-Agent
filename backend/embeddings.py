@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import gc
 import os
-from typing import List, Optional
+import re
+from typing import Dict, List, Optional
 
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
@@ -46,11 +48,57 @@ VECTOR_SIZE = 384  # all-MiniLM-L6-v2 output dimensionality
 _MIN_SCORE_DEFAULT = 0.20
 
 # ---------------------------------------------------------------------------
+# Hybrid retrieval (BM25 + semantic) configuration
+# ---------------------------------------------------------------------------
+
+# Number of candidates pulled from EACH retriever (semantic + BM25) before
+# fusion, and the size of the fused candidate pool returned by _hybrid_search.
+# Intentionally larger than the LLM context budget so fusion (and, in Step 2,
+# the cross-encoder reranker) has room to reorder before the final trim.
+_CANDIDATE_POOL = 20
+
+# Score-fusion weights. Semantic similarity is weighted higher than keyword
+# overlap because the embedding model captures paraphrase/synonymy that BM25
+# misses; BM25 contributes precision on exact term matches the embedding blurs.
+_SEMANTIC_WEIGHT = 0.6
+_BM25_WEIGHT = 0.4
+
+# ---------------------------------------------------------------------------
 # Module-level singletons (lazy-initialized on first use)
 # ---------------------------------------------------------------------------
 
 _model: Optional[SentenceTransformer] = None
 _client: Optional[QdrantClient] = None
+
+# Per-session BM25 keyword index, built during embed_and_store().
+#   session_id -> {"bm25": BM25Okapi, "chunks": List[dict]}
+# Held in process memory only. With Qdrant Cloud, vectors persist across a
+# restart but this dict does not — retrieval falls back to semantic-only for
+# any pre-restart session (handled gracefully in _bm25_search).
+_bm25_indexes: Dict[str, dict] = {}
+
+
+def _tokenize(text: str) -> List[str]:
+    """Lowercase alphanumeric word tokenizer used for BM25 indexing/querying."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _minmax_normalize(score_map: Dict[int, float]) -> Dict[int, float]:
+    """
+    Min-max normalize a {chunk_index: score} map into the range [0, 1].
+
+    Each retriever's raw scores live on different scales (cosine ∈ [−1,1],
+    BM25 ∈ [0, ∞)), so both are independently normalized before fusion.
+    If all scores are equal (or there is a single candidate), every entry maps
+    to 1.0 — they are equally relevant within that retriever.
+    """
+    if not score_map:
+        return {}
+    values = list(score_map.values())
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        return {k: 1.0 for k in score_map}
+    return {k: (v - lo) / (hi - lo) for k, v in score_map.items()}
 
 
 def _get_model() -> SentenceTransformer:
@@ -170,50 +218,46 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
 
     print(f"[embeddings] Stored {len(chunks)} chunk(s) in Qdrant collection '{session_id}'.")
 
+    # Build the per-session BM25 keyword index alongside the vector store, so
+    # retrieval can fuse semantic similarity with exact-term matching.
+    _build_bm25_index(chunks, session_id)
 
-def retrieve_relevant_chunks(
-    query: str,
-    session_id: str,
-    top_k: int = 10,
-) -> List[dict]:
+
+def _build_bm25_index(chunks: List[dict], session_id: str) -> None:
     """
-    Retrieve the top-k most relevant chunks via Qdrant cosine similarity search,
-    then filter out chunks below the minimum similarity threshold.
+    Build and cache an in-memory BM25Okapi index for a session.
 
-    Qdrant's Distance.COSINE returns cosine similarity scores in [−1, 1].
-    For sentence-transformer embeddings, practically all scores fall in [0, 0.9]:
-      • > 0.50  clearly relevant
-      • 0.20–0.50  related / weakly associated (included)
-      • < 0.20  essentially unrelated (filtered out)
+    Stores a lightweight copy of each chunk's payload (text, page, chunk_index,
+    section) parallel to the tokenized corpus so BM25 hits can be returned in
+    the same shape as semantic hits.
+    """
+    corpus_tokens = [_tokenize(c["text"]) for c in chunks]
+    bm25 = BM25Okapi(corpus_tokens)
+    _bm25_indexes[session_id] = {
+        "bm25": bm25,
+        "chunks": [
+            {
+                "text":        c["text"],
+                "page":        c["page"],
+                "chunk_index": c["chunk_index"],
+                "section":     c.get("section", "Unknown"),
+            }
+            for c in chunks
+        ],
+    }
+    print(f"[embeddings] Built BM25 index for session '{session_id}' ({len(chunks)} docs).")
 
-    The threshold is read from the MIN_RETRIEVAL_SCORE environment variable on
-    every call (default 0.20), so it can be tuned without restarting the server.
 
-    If score filtering removes ALL candidates, an empty list is returned.
-    The caller (agent.py) already handles this by retrying with the raw query
-    and issuing a refusal if that also returns nothing — no new failure paths.
-
-    Args:
-        query:      The user's natural-language question.
-        session_id: UUID string identifying the active upload session.
-        top_k:      Number of candidates to fetch from Qdrant before filtering.
-                    Intentionally higher than the LLM context budget so the
-                    filter has room to discard low-quality candidates.
-
-    Returns:
-        List of dicts sorted by relevance (most relevant first):
-            [{"text": str, "page": int, "chunk_index": int, "score": float}, ...]
-        Returns empty list if the session collection does not exist or all
-        candidates fall below the minimum score threshold.
+def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
+    """
+    Semantic retrieval via Qdrant cosine search (unchanged from the original
+    implementation, just factored out). Each result's "score" is the raw cosine
+    similarity in [−1, 1] — this is the value agent.py's confidence bands rely on.
     """
     client = _get_client()
-
     if not client.collection_exists(collection_name=session_id):
         print(f"[embeddings] Session '{session_id}' not found — returning empty results.")
         return []
-
-    # Read threshold on every call — allows runtime tuning via env var.
-    min_score = float(os.getenv("MIN_RETRIEVAL_SCORE", str(_MIN_SCORE_DEFAULT)))
 
     model = _get_model()
     query_vec: list[float] = (
@@ -225,30 +269,165 @@ def retrieve_relevant_chunks(
     hits = client.search(
         collection_name=session_id,
         query_vector=query_vec,
-        limit=top_k,
+        limit=limit,
         with_payload=True,
     )
 
-    results = []
-    filtered_count = 0
-    for hit in hits:
-        if hit.score >= min_score:
-            results.append(
-                {
-                    "text":        hit.payload["text"],
-                    "page":        hit.payload["page"],
-                    "chunk_index": hit.payload["chunk_index"],
-                    "score":       round(hit.score, 4),
-                }
-            )
-        else:
-            filtered_count += 1
+    return [
+        {
+            "text":        h.payload["text"],
+            "page":        h.payload["page"],
+            "chunk_index": h.payload["chunk_index"],
+            "section":     h.payload.get("section", "Unknown"),
+            "score":       float(h.score),
+        }
+        for h in hits
+    ]
 
-    if filtered_count:
+
+def _bm25_search(query: str, session_id: str, limit: int) -> List[dict]:
+    """
+    BM25 keyword retrieval over the per-session index.
+
+    Returns up to `limit` chunks with positive BM25 score, each carrying its raw
+    BM25 score under "score". Returns [] (semantic-only fallback) if the session
+    has no in-memory BM25 index — e.g. a Qdrant Cloud session that survived a
+    process restart.
+    """
+    entry = _bm25_indexes.get(session_id)
+    if not entry:
+        print(f"[embeddings] No BM25 index for session '{session_id}' — semantic-only fallback.")
+        return []
+
+    tokens = _tokenize(query)
+    if not tokens:
+        return []
+
+    bm25: BM25Okapi = entry["bm25"]
+    chunks: List[dict] = entry["chunks"]
+    scores = bm25.get_scores(tokens)  # np.ndarray aligned with chunks
+
+    order = np.argsort(scores)[::-1][:limit]
+    results = []
+    for i in order:
+        if scores[i] <= 0:
+            continue  # no term overlap — not a real keyword match
+        c = chunks[int(i)]
+        results.append({**c, "score": float(scores[i])})
+    return results
+
+
+def _hybrid_search(
+    query: str,
+    session_id: str,
+    pool_size: int = _CANDIDATE_POOL,
+) -> List[dict]:
+    """
+    Hybrid retrieval: fuse semantic (Qdrant) and BM25 keyword results.
+
+    Pipeline:
+      1. Semantic top-`pool_size`, gated by MIN_RETRIEVAL_SCORE (preserves the
+         existing "nothing relevant → refuse" fast-path: if no semantic chunk
+         clears the threshold, this returns [] exactly as before).
+      2. BM25 top-`pool_size` over the same session.
+      3. Min-max normalize each retriever's scores independently to [0, 1].
+      4. Fuse: final = 0.6·semantic_norm + 0.4·bm25_norm. A chunk present in
+         only one result set contributes 0 for the missing retriever.
+      5. Sort by fused score, return up to `pool_size` candidates.
+
+    Each returned chunk keeps "score" = its semantic cosine (0.0 for BM25-only
+    chunks) so agent.py's confidence/refusal logic is unaffected, and adds
+    "semantic_score", "bm25_score", "fused_score" (all normalized) for ranking
+    and observability. Fused order determines ranking; cosine still determines
+    confidence.
+    """
+    semantic = _semantic_search(query, session_id, pool_size)
+
+    # Gate on the semantic min-score threshold — read per call for live tuning.
+    min_score = float(os.getenv("MIN_RETRIEVAL_SCORE", str(_MIN_SCORE_DEFAULT)))
+    semantic_kept = [c for c in semantic if c["score"] >= min_score]
+    dropped = len(semantic) - len(semantic_kept)
+    if dropped:
         print(
             f"[embeddings] Score filter (min={min_score}): "
-            f"kept {len(results)}, dropped {filtered_count} chunk(s)."
+            f"kept {len(semantic_kept)}, dropped {dropped} semantic chunk(s)."
         )
+    print(f"[embeddings] Semantic candidates={len(semantic_kept)}")
+
+    if not semantic_kept:
+        # No relevant semantic content → preserve the existing fast-refusal path.
+        print("[embeddings] No semantic candidates above threshold — hybrid empty (refusal path).")
+        return []
+
+    bm25 = _bm25_search(query, session_id, pool_size)
+    print(f"[embeddings] BM25 candidates={len(bm25)}")
+
+    # Independent normalization of each retriever's raw scores.
+    sem_norm = _minmax_normalize({c["chunk_index"]: c["score"] for c in semantic_kept})
+    bm25_norm = _minmax_normalize({c["chunk_index"]: c["score"] for c in bm25})
+
+    # Union the two result sets, keeping the semantic cosine as "score".
+    by_index: Dict[int, dict] = {}
+    for c in semantic_kept:
+        by_index[c["chunk_index"]] = {**c}            # score = cosine
+    for c in bm25:
+        if c["chunk_index"] not in by_index:
+            by_index[c["chunk_index"]] = {**c, "score": 0.0}  # BM25-only: no cosine
+
+    fused: List[dict] = []
+    for idx, chunk in by_index.items():
+        s = sem_norm.get(idx, 0.0)
+        b = bm25_norm.get(idx, 0.0)
+        final = _SEMANTIC_WEIGHT * s + _BM25_WEIGHT * b
+        fused.append({
+            **chunk,
+            "score":          round(chunk["score"], 4),   # cosine — preserved
+            "semantic_score": round(s, 4),
+            "bm25_score":     round(b, 4),
+            "fused_score":    round(final, 4),
+        })
+
+    fused.sort(key=lambda x: x["fused_score"], reverse=True)
+    fused = fused[:pool_size]
+
+    print(f"[embeddings] Hybrid candidates={len(fused)}")
+    if fused:
+        print(f"[embeddings] Hybrid top score={fused[0]['fused_score']}")
+    return fused
+
+
+def retrieve_relevant_chunks(
+    query: str,
+    session_id: str,
+    top_k: int = 10,
+) -> List[dict]:
+    """
+    Retrieve the most relevant chunks via hybrid (BM25 + semantic) search.
+
+    Behavior contract is unchanged for callers:
+      • Returns up to `top_k` chunks, most relevant first.
+      • Returns [] when the session is missing or nothing clears the semantic
+        relevance threshold — agent.py's fallback + refusal paths still apply.
+      • Each chunk's "score" remains the semantic cosine similarity, so the
+        confidence bands and citation logic in agent.py work as before.
+
+    Internally a pool of `_CANDIDATE_POOL` (20) candidates is fused; the top
+    `top_k` are returned. That 20-candidate pool is what Step 2's cross-encoder
+    reranker will consume before trimming to the final set.
+
+    Args:
+        query:      The user's natural-language question (already rewritten /
+                    expanded by agent.py — this layer does not alter it).
+        session_id: UUID string identifying the active upload session.
+        top_k:      Number of fused chunks to return (default 10).
+
+    Returns:
+        List of dicts sorted by fused relevance (most relevant first):
+            [{"text", "page", "chunk_index", "section", "score",
+              "semantic_score", "bm25_score", "fused_score"}, ...]
+    """
+    candidates = _hybrid_search(query, session_id, pool_size=_CANDIDATE_POOL)
+    results = candidates[:top_k]
 
     print(
         f"[embeddings] Retrieved {len(results)} chunk(s); "
@@ -267,6 +446,10 @@ def delete_session(session_id: str) -> None:
         session_id: UUID string identifying the session to remove.
     """
     client = _get_client()
+
+    # Drop the in-memory BM25 index regardless of Qdrant state.
+    if _bm25_indexes.pop(session_id, None) is not None:
+        print(f"[embeddings] Dropped BM25 index for session '{session_id}'.")
 
     if not client.collection_exists(collection_name=session_id):
         print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
