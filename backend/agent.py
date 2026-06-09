@@ -9,9 +9,10 @@ Mistral exposes an OpenAI-compatible REST endpoint, so this module uses plain
 requests.post() — no SDK required.
 """
 
+import json
 import os
 import re
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 import requests # type: ignore
 
@@ -871,6 +872,77 @@ def is_refusal(answer: str) -> bool:
     return stripped.startswith(REFUSAL_PREFIX) or bool(_REFUSAL_RE.match(stripped))
 
 
+def _run_retrieval(
+    query: str,
+    session_id: str,
+    conversation_history: List[dict],
+) -> List[dict]:
+    """
+    Build the retrieval query and fetch chunks via the layered fallback strategy.
+
+    Shared by get_answer() (non-streaming) and stream_answer() (streaming) so
+    both response paths retrieve identically — the only difference between the
+    two is how the Mistral completion is consumed, not how chunks are selected.
+
+    Steps:
+      1. Build retrieval query (contextual rewrite + keyword enrichment).
+      2. Apply synonym expansion.
+      3. Retrieve top-10 with progressive fallbacks:
+           Primary    — expanded retrieval query
+           Fallback 1 — retrieval query without synonym expansion
+           Fallback 2 — original user query (guards against enrichment drift)
+
+    Returns:
+        List of chunk dicts ordered best-first (may be empty → caller refuses).
+    """
+    # Step 1: Build retrieval query (contextual rewriting + enrichment)
+    retrieval_query = _build_retrieval_query(query, conversation_history)
+
+    # Step 2: Apply synonym expansion to the retrieval query
+    expanded_query = _expand_query(retrieval_query)
+    if expanded_query != retrieval_query:
+        print(f"[agent] Synonym expansion applied.")
+    print(f"[agent] Final retrieval query (len={len(expanded_query)}): {expanded_query!r}")
+
+    # Step 3: Retrieve — layered fallback strategy
+    chunks = retrieve_relevant_chunks(expanded_query, session_id, top_k=10)
+
+    if not chunks:
+        print(f"[agent] Fallback 1: retrieval query without expansion.")
+        chunks = retrieve_relevant_chunks(retrieval_query, session_id, top_k=10)
+
+    if not chunks and retrieval_query != query:
+        print(f"[agent] Fallback 2: original user query.")
+        expanded_original = _expand_query(query)
+        chunks = retrieve_relevant_chunks(expanded_original, session_id, top_k=10)
+        if not chunks:
+            chunks = retrieve_relevant_chunks(query, session_id, top_k=10)
+
+    return chunks
+
+
+def _log_confidence(chunks: List[dict]) -> tuple[float, set]:
+    """
+    Log the retrieval confidence band and return (top_score, page_set).
+
+    Shared by both response paths so logging is identical.
+    """
+    top_score = chunks[0].get("score", 0.0)
+    chunk_pages_set = {c["page"] for c in chunks}
+    if top_score >= _HIGH_CONFIDENCE_SCORE:
+        confidence_label = "HIGH"
+    elif top_score >= 0.30:
+        confidence_label = "MEDIUM"
+    else:
+        confidence_label = "LOW"
+    print(
+        f"[agent] Retrieval confidence: {confidence_label} "
+        f"(top_score={top_score:.4f}, chunks={len(chunks)}, "
+        f"pages={sorted(chunk_pages_set)})"
+    )
+    return top_score, chunk_pages_set
+
+
 def get_answer(
     query: str,
     session_id: str,
@@ -925,39 +997,12 @@ def get_answer(
     )
 
     # ------------------------------------------------------------------
-    # Step 1: Build retrieval query (contextual rewriting + enrichment)
-    # Rewriting resolves pronouns/ordinals; enrichment adds document vocab
-    # from the previous assistant response to boost recall on follow-ups.
-    # The ORIGINAL query always goes to the LLM — this only affects Qdrant.
+    # Steps 1-3: Build retrieval query + retrieve with layered fallbacks
+    # Rewriting resolves pronouns/ordinals; enrichment adds document vocab;
+    # synonym expansion broadens recall. The ORIGINAL query always goes to
+    # the LLM — this only affects Qdrant retrieval.
     # ------------------------------------------------------------------
-    retrieval_query = _build_retrieval_query(query, conversation_history)
-
-    # ------------------------------------------------------------------
-    # Step 2: Apply synonym expansion to the retrieval query
-    # ------------------------------------------------------------------
-    expanded_query = _expand_query(retrieval_query)
-    if expanded_query != retrieval_query:
-        print(f"[agent] Synonym expansion applied.")
-    print(f"[agent] Final retrieval query (len={len(expanded_query)}): {expanded_query!r}")
-
-    # ------------------------------------------------------------------
-    # Step 3: Retrieve — layered fallback strategy
-    #   Primary:    expanded retrieval query (rewritten + enriched + synonyms)
-    #   Fallback 1: retrieval query without synonym expansion
-    #   Fallback 2: original user query (guards against enrichment drift)
-    # ------------------------------------------------------------------
-    chunks = retrieve_relevant_chunks(expanded_query, session_id, top_k=10)
-
-    if not chunks:
-        print(f"[agent] Fallback 1: retrieval query without expansion.")
-        chunks = retrieve_relevant_chunks(retrieval_query, session_id, top_k=10)
-
-    if not chunks and retrieval_query != query:
-        print(f"[agent] Fallback 2: original user query.")
-        expanded_original = _expand_query(query)
-        chunks = retrieve_relevant_chunks(expanded_original, session_id, top_k=10)
-        if not chunks:
-            chunks = retrieve_relevant_chunks(query, session_id, top_k=10)
+    chunks = _run_retrieval(query, session_id, conversation_history)
 
     # ------------------------------------------------------------------
     # Step 4: Immediate refusal — no chunks means the topic is absent
@@ -975,19 +1020,7 @@ def get_answer(
     # ------------------------------------------------------------------
     # Retrieval confidence summary (logged before the API call)
     # ------------------------------------------------------------------
-    top_score = chunks[0].get("score", 0.0)
-    chunk_pages_set = {c["page"] for c in chunks}
-    if top_score >= _HIGH_CONFIDENCE_SCORE:
-        confidence_label = "HIGH"
-    elif top_score >= 0.30:
-        confidence_label = "MEDIUM"
-    else:
-        confidence_label = "LOW"
-    print(
-        f"[agent] Retrieval confidence: {confidence_label} "
-        f"(top_score={top_score:.4f}, chunks={len(chunks)}, "
-        f"pages={sorted(chunk_pages_set)})"
-    )
+    top_score, chunk_pages_set = _log_confidence(chunks)
 
     # ------------------------------------------------------------------
     # Step 5: Build user message with embedded context
@@ -1075,3 +1108,156 @@ def get_answer(
         "cited_pages": cited_pages,
         "chunks_used": len(chunks),
     }
+
+
+# ---------------------------------------------------------------------------
+# Streaming response (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _ndjson(obj: dict) -> str:
+    """Serialise one streaming event as a newline-delimited JSON line."""
+    return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+def stream_answer(
+    query: str,
+    session_id: str,
+    conversation_history: Optional[List[dict]] = None,
+) -> Iterator[str]:
+    """
+    Streaming counterpart to get_answer().
+
+    Runs the identical retrieval pipeline (_run_retrieval), then consumes
+    Mistral's response token-by-token via the OpenAI-compatible streaming API
+    (stream=True). Yields newline-delimited JSON (NDJSON) events so the
+    frontend can render tokens as they arrive:
+
+        {"type": "token", "text": "..."}                      ← zero or more
+        {"type": "done",  "answer": str, "cited_pages": [..],
+                          "is_refusal": bool, "chunks_used": int}   ← exactly one
+        {"type": "error", "text": "..."}                      ← on failure
+
+    Citations are parsed from the fully-accumulated answer once the stream
+    completes (the same _extract_cited_pages / _validate_citations path as
+    get_answer), then emitted in the terminal "done" event.
+
+    This is a synchronous generator; StreamingResponse in main.py iterates it
+    in a threadpool so the blocking requests call never stalls the event loop.
+
+    Args:
+        query:                The user's natural-language question.
+        session_id:           UUID identifying the active upload session.
+        conversation_history: Prior turns (None/[] for a fresh conversation).
+
+    Yields:
+        NDJSON-encoded event strings (each ending in "\n").
+    """
+    if conversation_history is None:
+        conversation_history = []
+
+    print(
+        f"[agent] STREAM Query: {query!r}  |  session: {session_id}  |  "
+        f"history_turns={len(conversation_history)}"
+    )
+
+    # ── Steps 1-3: retrieve (shared with get_answer) ─────────────────────────
+    chunks = _run_retrieval(query, session_id, conversation_history)
+
+    # ── Step 4: immediate refusal — stream the refusal sentence as one token ─
+    if not chunks:
+        print("[agent] STREAM REFUSAL_REASON: zero_chunks — no retrievable content.")
+        topic = query if len(query) <= 80 else query[:77] + "…"
+        refusal = f"{REFUSAL_PREFIX} {topic}."
+        yield _ndjson({"type": "token", "text": refusal})
+        yield _ndjson({
+            "type": "done", "answer": refusal,
+            "cited_pages": [], "is_refusal": True, "chunks_used": 0,
+        })
+        return
+
+    top_score, chunk_pages_set = _log_confidence(chunks)
+
+    # ── Steps 5-6: build the message list (shared helpers) ───────────────────
+    user_message_content = _build_user_message(query, chunks)
+    messages_for_api = _build_messages_for_api(
+        history=list(conversation_history),
+        current_user_content=user_message_content,
+    )
+
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "MISTRAL_API_KEY environment variable is not set. Add it to your .env file."
+        )
+
+    print(
+        f"[agent] STREAM Calling {MODEL} via Mistral API (stream=True) | "
+        f"chunks={len(chunks)} | history_turns={len(conversation_history)} | "
+        f"top_chunk_score={top_score}"
+    )
+
+    # ── Step 7: stream the completion ────────────────────────────────────────
+    full_parts: List[str] = []
+    try:
+        with requests.post(
+            MISTRAL_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": messages_for_api,
+                "max_tokens": MAX_TOKENS,
+                "stream": True,
+            },
+            timeout=60,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue  # skip keep-alive / malformed fragments
+                delta = payload.get("choices", [{}])[0].get("delta", {})
+                token = delta.get("content")
+                if token:
+                    full_parts.append(token)
+                    yield _ndjson({"type": "token", "text": token})
+
+    except Exception as exc:
+        print(f"[agent] STREAM error during generation: {exc!r}")
+        yield _ndjson({"type": "error", "text": f"Streaming failed: {exc}"})
+        return
+
+    # ── Step 8: parse + validate citations from the accumulated answer ───────
+    answer = "".join(full_parts)
+    cited_pages_raw = _extract_cited_pages(answer)
+    cited_pages = _validate_citations(cited_pages_raw, chunk_pages_set)
+    refusal = is_refusal(answer)
+
+    if refusal:
+        print(
+            f"[agent] STREAM REFUSAL_REASON: llm_chose_refusal — chunks were present "
+            f"(top_score={top_score:.4f}) but LLM issued refusal."
+        )
+    print(
+        f"[agent] STREAM Response done | is_refusal={refusal} | "
+        f"cited_pages_raw={cited_pages_raw} | cited_pages_valid={cited_pages} | "
+        f"chars={len(answer)}"
+    )
+
+    yield _ndjson({
+        "type": "done",
+        "answer": answer,
+        "cited_pages": cited_pages,
+        "is_refusal": refusal,
+        "chunks_used": len(chunks),
+    })

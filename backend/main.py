@@ -20,6 +20,7 @@ intentional for assessment scope; a production system would use Redis.
 """
 
 import asyncio
+import json
 import os
 import time
 import traceback
@@ -30,9 +31,10 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from agent import get_answer, is_refusal
+from agent import get_answer, is_refusal, stream_answer
 from embeddings import check_qdrant_connectivity, delete_session as _delete_session
 from embeddings import embed_and_store, get_status, warmup
 from pdf_processor import parse_and_chunk
@@ -341,7 +343,8 @@ async def upload_pdf(
         "filename":    filename,
         "chunk_count": len(chunks),
         "created_at":  datetime.now(timezone.utc).isoformat(),
-        "doc_summary": None,   # filled in by _generate_summary_background
+        "status":      "ready",  # embed is synchronous — session only exists once indexed
+        "doc_summary": None,     # filled in by _generate_summary_background
     }
     histories[session_id] = []
 
@@ -455,6 +458,134 @@ async def chat(request: ChatRequest):
         "chunks_used": result["chunks_used"],
         "is_refusal":  refusal,
         "session_id":  request.session_id,
+    }
+
+
+@app.post("/chat/stream", summary="Chat with the uploaded PDF (streaming)")
+async def chat_stream(request: ChatRequest):
+    """
+    Streaming variant of /chat — emits the answer token-by-token as NDJSON.
+
+    Wire protocol (newline-delimited JSON, media type application/x-ndjson):
+        {"type": "token", "text": "..."}                       ← zero or more
+        {"type": "done",  "answer", "cited_pages",
+                          "is_refusal", "chunks_used"}          ← exactly one
+        {"type": "error", "text": "..."}                       ← on failure
+
+    Document-level queries are answered from the pre-generated summary and
+    streamed as a single token event (no Mistral call), mirroring /chat.
+
+    Conversation history is persisted only once the stream finishes, using the
+    full accumulated answer captured from the terminal "done" event.
+
+    Raises (before streaming begins):
+        404: session_id not found.
+        400: empty message.
+    """
+    if request.session_id not in sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{request.session_id}' not found. Please upload a PDF first.",
+        )
+
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Message cannot be empty.",
+        )
+
+    history = histories[request.session_id]
+    session_meta = sessions[request.session_id]
+    doc_summary = session_meta.get("doc_summary")
+
+    print(
+        f"[main] Chat/stream | session={request.session_id} "
+        f"| turns={len(history)} | query={message!r:.80}"
+    )
+
+    # ── Document-level fast path — stream the summary as a single token ───────
+    if is_document_level_query(message) and doc_summary:
+        print(f"[main] ROUTE: doc_summary (streaming, skipping vector retrieval)")
+        answer = format_summary_answer(message, doc_summary, session_meta["filename"])
+        history.append({"role": "user",      "content": message})
+        history.append({"role": "assistant", "content": answer})
+
+        def _summary_stream():
+            yield json.dumps({"type": "token", "text": answer}, ensure_ascii=False) + "\n"
+            yield json.dumps(
+                {"type": "done", "answer": answer, "cited_pages": [],
+                 "is_refusal": False, "chunks_used": 0},
+                ensure_ascii=False,
+            ) + "\n"
+
+        return StreamingResponse(_summary_stream(), media_type="application/x-ndjson")
+
+    if is_document_level_query(message) and not doc_summary:
+        print(f"[main] ROUTE: doc-level query but summary unavailable — vector retrieval fallback")
+
+    # ── Normal streaming retrieval path ──────────────────────────────────────
+    # Snapshot history BEFORE the new turn so the agent sees prior context only.
+    history_snapshot = list(history)
+
+    def _event_stream():
+        final_answer = None
+        try:
+            for line in stream_answer(message, request.session_id, history_snapshot):
+                # Capture the full answer from the terminal "done" event so we
+                # can persist it to conversation history once the stream ends.
+                stripped = line.strip()
+                if stripped:
+                    try:
+                        evt = json.loads(stripped)
+                        if evt.get("type") == "done":
+                            final_answer = evt.get("answer", "")
+                    except json.JSONDecodeError:
+                        pass
+                yield line
+        except Exception as exc:
+            print(f"[main] Chat/stream pipeline error:\n{traceback.format_exc()}")
+            yield json.dumps(
+                {"type": "error", "text": f"LLM call failed: {exc}"},
+                ensure_ascii=False,
+            ) + "\n"
+        finally:
+            # Persist the turn only if we got a complete answer.
+            if final_answer is not None:
+                history.append({"role": "user",      "content": message})
+                history.append({"role": "assistant", "content": final_answer})
+                print(
+                    f"[main] Chat/stream persisted | source=vector_retrieval | "
+                    f"is_refusal={is_refusal(final_answer)}"
+                )
+
+    return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
+
+
+@app.get("/session/{session_id}/status", summary="Session indexing status")
+async def session_status(session_id: str):
+    """
+    Report whether a session's content is indexed and ready for chat.
+
+    Embedding runs synchronously on the /upload critical path (kept that way
+    for Render free-tier 60 s-timeout safety), so a session only appears in the
+    sessions dict once indexing has completed — meaning this endpoint returns
+    "ready" for any session it can find. The frontend polls it as a safety net
+    before unlocking the chat input; it is the integration point that would
+    report "indexing" if embedding were ever moved to a background task.
+
+    Raises:
+        404: session_id not found.
+    """
+    if session_id not in sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    meta = sessions[session_id]
+    return {
+        "status":      meta.get("status", "ready"),
+        "chunk_count": meta.get("chunk_count", 0),
     }
 
 

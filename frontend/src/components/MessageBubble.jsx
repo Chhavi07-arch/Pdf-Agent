@@ -29,7 +29,25 @@ function renderWithCitations(text) {
   })
 }
 
-export default function MessageBubble({ role, content, citedPages, isRefusal, isError }) {
+// A blinking caret appended to the tail of an in-flight streaming message.
+function StreamingCursor() {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: 'inline-block',
+        width: '2px',
+        height: '1em',
+        marginLeft: '2px',
+        verticalAlign: 'text-bottom',
+        background: '#a78bfa',
+        animation: 'blink 1s step-start infinite',
+      }}
+    />
+  )
+}
+
+export default function MessageBubble({ role, content, citedPages, isRefusal, isError, streaming }) {
   const isUser      = role === 'user'
   const isAssistant = role === 'assistant'
 
@@ -108,6 +126,7 @@ export default function MessageBubble({ role, content, citedPages, isRefusal, is
 
           <p className="text-sm leading-relaxed whitespace-pre-wrap" style={{color: textColor}}>
             {renderWithCitations(content)}
+            {streaming && <StreamingCursor />}
           </p>
         </div>
 

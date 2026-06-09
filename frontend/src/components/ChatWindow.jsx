@@ -106,11 +106,14 @@ export default function ChatWindow({ messages, onSendMessage, disabled, isLoadin
             citedPages={msg.cited_pages ?? []}
             isRefusal={msg.is_refusal ?? false}
             isError={msg.is_error ?? false}
+            streaming={msg.streaming ?? false}
           />
         ))}
 
-        {/* Typing indicator — staggered purple dots */}
-        {isLoading && (
+        {/* Typing indicator — staggered purple dots.
+            Hidden once a streaming bubble is in flight (its blinking cursor
+            signals activity instead, avoiding a duplicate indicator). */}
+        {isLoading && !messages[messages.length - 1]?.streaming && (
           <div className="flex items-start gap-2.5">
             <span className="flex items-center justify-center w-7 h-7 rounded-full shrink-0 mt-0.5" style={{background: 'rgba(139, 92, 246, 0.2)'}}>
               <span style={{color: '#a78bfa'}}><BotIcon className="w-3.5 h-3.5" /></span>

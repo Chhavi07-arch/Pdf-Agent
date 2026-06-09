@@ -53,50 +53,85 @@ export default function App() {
 
     const sid = activeSessionId
 
+    // Push the user turn AND an empty streaming assistant placeholder. Tokens
+    // from the NDJSON stream are appended into the placeholder as they arrive.
     setMessagesMap(prev => ({
       ...prev,
-      [sid]: [...(prev[sid] ?? []), { role: 'user', content: trimmed }],
+      [sid]: [
+        ...(prev[sid] ?? []),
+        { role: 'user', content: trimmed },
+        { role: 'assistant', content: '', cited_pages: [], is_refusal: false, streaming: true },
+      ],
     }))
     setIsLoading(true)
 
+    // Patch the last message (the streaming assistant bubble) for this session.
+    const patchLast = updater =>
+      setMessagesMap(prev => {
+        const list = prev[sid] ? [...prev[sid]] : []
+        const i = list.length - 1
+        if (i >= 0) list[i] = updater(list[i])
+        return { ...prev, [sid]: list }
+      })
+
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
+      const res = await fetch(`${API_BASE}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, message: trimmed }),
       })
 
-      const data = await res.json()
-
       if (!res.ok) {
-        throw new Error(data.detail || `Server error ${res.status}`)
+        let detail = `Server error ${res.status}`
+        try { const e = await res.json(); detail = e.detail || detail } catch { /* non-JSON */ }
+        throw new Error(detail)
       }
 
-      setMessagesMap(prev => ({
-        ...prev,
-        [sid]: [
-          ...(prev[sid] ?? []),
-          {
-            role: 'assistant',
-            content: data.answer,
-            cited_pages: data.cited_pages ?? [],
-            is_refusal: data.is_refusal ?? false,
-          },
-        ],
-      }))
+      // Read the NDJSON stream line-by-line.
+      const reader  = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        let nl
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl).trim()
+          buffer = buffer.slice(nl + 1)
+          if (!line) continue
+
+          let evt
+          try { evt = JSON.parse(line) } catch { continue }
+
+          if (evt.type === 'token') {
+            patchLast(m => ({ ...m, content: m.content + evt.text }))
+          } else if (evt.type === 'done') {
+            patchLast(m => ({
+              ...m,
+              content: evt.answer ?? m.content,
+              cited_pages: evt.cited_pages ?? [],
+              is_refusal: evt.is_refusal ?? false,
+              streaming: false,
+            }))
+          } else if (evt.type === 'error') {
+            patchLast(m => ({ ...m, content: evt.text, is_error: true, streaming: false }))
+          }
+        }
+      }
+
+      // Clear the streaming flag in case the stream ended without a done event.
+      patchLast(m => (m.streaming ? { ...m, streaming: false } : m))
     } catch (err) {
-      setMessagesMap(prev => ({
-        ...prev,
-        [sid]: [
-          ...(prev[sid] ?? []),
-          {
-            role: 'assistant',
-            content: `Something went wrong: ${err.message}`,
-            cited_pages: [],
-            is_refusal: false,
-            is_error: true,
-          },
-        ],
+      patchLast(m => ({
+        ...m,
+        content: `Something went wrong: ${err.message}`,
+        cited_pages: [],
+        is_refusal: false,
+        is_error: true,
+        streaming: false,
       }))
     } finally {
       setIsLoading(false)

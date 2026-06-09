@@ -69,6 +69,23 @@ export default function PDFUploader({
     uploadFile(file)
   }
 
+  // Poll the status endpoint until the session reports "ready".
+  // Embedding is synchronous server-side, so this returns on the first poll —
+  // it is a safety net that also lets the UI confirm indexing before unlocking.
+  async function waitUntilReady(sessionId, { tries = 20, intervalMs = 500 } = {}) {
+    for (let i = 0; i < tries; i++) {
+      try {
+        const res = await fetch(`${apiBase}/session/${sessionId}/status`)
+        if (res.ok) {
+          const s = await res.json()
+          if (s.status === 'ready') return s
+        }
+      } catch { /* transient — retry */ }
+      await new Promise(r => setTimeout(r, intervalMs))
+    }
+    return null  // timed out — proceed anyway; chat will surface any real error
+  }
+
   async function uploadFile(file) {
     setPhase('uploading')
     setStageIdx(0)
@@ -84,6 +101,9 @@ export default function PDFUploader({
       if (!res.ok) {
         throw new Error(data.detail || `Upload failed (${res.status})`)
       }
+
+      // Confirm the session is indexed before unlocking chat.
+      await waitUntilReady(data.session_id)
 
       // Notify parent to add to list and make active, then reset to idle
       onUploadSuccess(data.session_id, data.filename, data.chunk_count)
@@ -132,6 +152,23 @@ export default function PDFUploader({
             <Spinner />
             <p className="text-sm font-medium" style={{color: '#a78bfa'}}>Processing document…</p>
             <p className="text-xs" style={{color: '#64748b'}}>{UPLOAD_STAGES[stageIdx]}</p>
+
+            {/* Indeterminate progress bar — embedding time is not reported
+                incrementally, so a sliding bar conveys "working" honestly. */}
+            <div
+              className="w-full mt-1 overflow-hidden rounded-full"
+              style={{height: '4px', background: 'rgba(139, 92, 246, 0.15)'}}
+            >
+              <div
+                style={{
+                  width: '40%',
+                  height: '100%',
+                  borderRadius: '9999px',
+                  background: 'linear-gradient(90deg, #8b5cf6, #6366f1)',
+                  animation: 'progressSlide 1.4s ease-in-out infinite',
+                }}
+              />
+            </div>
           </div>
         ) : (
           <>
