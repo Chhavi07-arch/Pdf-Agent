@@ -24,13 +24,14 @@ from __future__ import annotations
 import gc
 import os
 import re
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,12 +64,19 @@ _CANDIDATE_POOL = 20
 _SEMANTIC_WEIGHT = 0.6
 _BM25_WEIGHT = 0.4
 
+# Cross-encoder reranker (Step 2). The 20-candidate hybrid pool is re-scored by
+# this model and trimmed to the best _RERANK_TOP_K, which both improves
+# precision and shrinks the LLM prompt. Loaded lazily (NOT at startup).
+_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+_RERANK_TOP_K = 7
+
 # ---------------------------------------------------------------------------
 # Module-level singletons (lazy-initialized on first use)
 # ---------------------------------------------------------------------------
 
 _model: Optional[SentenceTransformer] = None
 _client: Optional[QdrantClient] = None
+_cross_encoder: Optional[CrossEncoder] = None
 
 # Per-session BM25 keyword index, built during embed_and_store().
 #   session_id -> {"bm25": BM25Okapi, "chunks": List[dict]}
@@ -139,6 +147,21 @@ def _get_client() -> QdrantClient:
             _client = QdrantClient(":memory:")
             print("[embeddings] In-memory Qdrant client ready.")
     return _client
+
+
+def get_cross_encoder() -> CrossEncoder:
+    """
+    Return the shared cross-encoder reranker, loading it on first call.
+
+    Loaded lazily on the first reranked query — never at application startup —
+    so cold-start (and the upload critical path) does not pay for this model.
+    """
+    global _cross_encoder
+    if _cross_encoder is None:
+        print("[embeddings] Loading cross encoder...")
+        _cross_encoder = CrossEncoder(_CROSS_ENCODER_MODEL)
+        print("[embeddings] Cross encoder loaded")
+    return _cross_encoder
 
 
 def _encode_in_batches(
@@ -396,38 +419,105 @@ def _hybrid_search(
     return fused
 
 
+def _rerank_candidates(
+    query: str,
+    candidates: List[dict],
+    final_k: int = _RERANK_TOP_K,
+) -> List[dict]:
+    """
+    Re-score hybrid candidates with the cross-encoder and keep the best `final_k`.
+
+    A cross-encoder reads (query, chunk_text) jointly rather than comparing two
+    independent embeddings, so it judges relevance far more precisely than the
+    bi-encoder used for retrieval — at a cost only affordable on a small
+    candidate set, which is exactly what hybrid retrieval has narrowed us to.
+
+    Each surviving chunk gains a "rerank_score" field; all existing fields
+    (score, semantic_score, bm25_score, fused_score) are preserved untouched.
+
+    On any failure (model load or predict error) this degrades gracefully to the
+    fused order so retrieval never breaks — the chunks then carry their
+    fused_score copied into rerank_score for schema consistency.
+    """
+    if not candidates:
+        return []
+
+    print(f"[embeddings] Reranking {len(candidates)} candidates")
+    t0 = time.monotonic()
+    try:
+        cross_encoder = get_cross_encoder()
+        pairs = [(query, c["text"]) for c in candidates]
+        scores = cross_encoder.predict(pairs)
+
+        reranked = [
+            {**c, "rerank_score": round(float(s), 4)}
+            for c, s in zip(candidates, scores)
+        ]
+        reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
+        reranked = reranked[:final_k]
+
+        elapsed = time.monotonic() - t0
+        print(
+            f"[embeddings] Cross encoder top score="
+            f"{reranked[0]['rerank_score'] if reranked else 'n/a'}"
+        )
+        print(f"[embeddings] Returning top {len(reranked)} reranked chunks")
+        print(f"[embeddings] Rerank completed in {elapsed:.2f}s")
+        return reranked
+
+    except Exception as exc:
+        print(
+            f"[embeddings] Rerank failed: {exc!r} — falling back to fused order "
+            f"(no quality gain this query, but retrieval still works)."
+        )
+        return [
+            {**c, "rerank_score": c.get("fused_score")}
+            for c in candidates[:final_k]
+        ]
+
+
 def retrieve_relevant_chunks(
     query: str,
     session_id: str,
     top_k: int = 10,
 ) -> List[dict]:
     """
-    Retrieve the most relevant chunks via hybrid (BM25 + semantic) search.
+    Retrieve the most relevant chunks: hybrid (BM25 + semantic) → cross-encoder rerank.
+
+    Pipeline:
+      1. _hybrid_search → up to _CANDIDATE_POOL (20) fused candidates.
+      2. _rerank_candidates → cross-encoder re-scores and keeps the best
+         _RERANK_TOP_K (7). This both lifts precision and shrinks the LLM prompt.
+      3. Return up to `top_k` of the reranked set (default top_k=10 ≥ 7, so the
+         full reranked set is returned).
 
     Behavior contract is unchanged for callers:
-      • Returns up to `top_k` chunks, most relevant first.
       • Returns [] when the session is missing or nothing clears the semantic
-        relevance threshold — agent.py's fallback + refusal paths still apply.
+        relevance threshold — agent.py's fallback + refusal paths still apply
+        (the refusal fast-path is gated inside _hybrid_search, before reranking).
       • Each chunk's "score" remains the semantic cosine similarity, so the
         confidence bands and citation logic in agent.py work as before.
-
-    Internally a pool of `_CANDIDATE_POOL` (20) candidates is fused; the top
-    `top_k` are returned. That 20-candidate pool is what Step 2's cross-encoder
-    reranker will consume before trimming to the final set.
 
     Args:
         query:      The user's natural-language question (already rewritten /
                     expanded by agent.py — this layer does not alter it).
         session_id: UUID string identifying the active upload session.
-        top_k:      Number of fused chunks to return (default 10).
+        top_k:      Maximum number of chunks to return (default 10).
 
     Returns:
-        List of dicts sorted by fused relevance (most relevant first):
+        List of dicts ordered by rerank relevance (most relevant first):
             [{"text", "page", "chunk_index", "section", "score",
-              "semantic_score", "bm25_score", "fused_score"}, ...]
+              "semantic_score", "bm25_score", "fused_score", "rerank_score"}, ...]
     """
     candidates = _hybrid_search(query, session_id, pool_size=_CANDIDATE_POOL)
-    results = candidates[:top_k]
+
+    # Refusal fast-path preserved: empty hybrid → empty result, no rerank.
+    if not candidates:
+        print("[embeddings] Retrieved 0 chunk(s); top score=n/a.")
+        return []
+
+    reranked = _rerank_candidates(query, candidates, final_k=_RERANK_TOP_K)
+    results = reranked[:top_k]
 
     print(
         f"[embeddings] Retrieved {len(results)} chunk(s); "

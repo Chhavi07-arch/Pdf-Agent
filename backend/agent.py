@@ -60,6 +60,16 @@ respond with EXACTLY this sentence, substituting the actual topic:
   "I'm sorry, but the uploaded document does not contain information about [topic]."
 Do not add any text before or after this sentence when issuing a full refusal.
 
+CONFIDENCE OVERRIDE (CRITICAL — overrides the refusal instinct):
+If the user message contains a line beginning "RETRIEVAL NOTE: HIGH" or an
+"ANSWER REQUIRED" directive, the system has already VERIFIED that relevant
+content is present in the excerpts. In that case you are FORBIDDEN from issuing
+the refusal sentence. You MUST locate the relevant content — applying the
+Semantic Equivalence (Rule 7) and Concept Reframing (Rule 9) rules below — and
+answer with page citations. If only part of the question is covered, answer that
+part and add the Rule 4 note for the uncovered aspect. A full refusal under a
+HIGH retrieval note is a critical failure.
+
 **Rule 4 — Partial Information Handling**
 If the document provides information related to the question but does
 not fully answer it:
@@ -104,8 +114,14 @@ Treat these phrases as equivalent when searching the excerpts:
 - "convert" = "transform" = "translate" = "map" = "adapt"
 - "log" = "logging" = "observability" = "metrics" = "tracking"
 - "cache" = "caching" = "batch" = "buffering"
+- "drawbacks" = "disadvantages" = "cons" = "downsides" = "limitations" = "pitfalls" = "problems" = "issues" = "trade-offs" = "when not to use" = "cautions" = "forces" = "constraints"
+- "benefits" = "advantages" = "pros" = "strengths" = "upsides" = "when to use" = "motivation"
+- "example" = "examples" = "demonstration" = "illustration" = "sample" = "for instance" = "e.g." = "scenario"
 If the user asks about any term in a group, search the excerpts for ALL
 terms in that group before deciding the answer is absent.
+In particular: a "When NOT to use", "Limitations", "Pitfalls", "Forces", or
+"Constraints" section IS the answer to a question about drawbacks/disadvantages/
+problems — treat them as the same thing and answer from that section.
 If examples or code in the excerpts demonstrate a concept, include them
 as part of your answer — code examples count as relevant information.
 
@@ -127,6 +143,8 @@ Reframing examples you must apply:
 - "other than X" → reframe as → "alternative to X", "instead of X"
 - "without using X" → reframe as → "alternative approach", "different method"
 - "can it also" → reframe as → "alternative", "additional", "also"
+- "drawbacks / disadvantages / problems / cons of X" → reframe as → "when NOT to use X", "limitations of X", "trade-offs", "cautions", "forces and constraints", "pitfalls"
+- "benefits / advantages / pros of X" → reframe as → "when to use X", "why use X", "motivation for X"
 
 Process for indirect questions:
 1. Identify the indirect phrase ("outside", "besides", "other than", "alternative")
@@ -287,9 +305,22 @@ def _format_context_block(chunks: List[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_user_message(query: str, chunks: List[dict]) -> str:
+def _build_user_message(
+    query: str,
+    chunks: List[dict],
+    force_answer: bool = False,
+    retry: bool = False,
+) -> str:
     """
     Compose the full user-turn content: context block + question.
+
+    force_answer: set when retrieval confidence is HIGH (top cosine ≥
+        _HIGH_CONFIDENCE_SCORE). Injects a "RETRIEVAL NOTE: HIGH / ANSWER
+        REQUIRED" directive that the system prompt's Rule-3 confidence override
+        keys on — the model is then forbidden from issuing a full refusal.
+    retry: set on the non-streaming second attempt after the model refused
+        despite HIGH confidence. Adds an explicit "previous attempt incorrectly
+        refused" escalation.
 
     Injecting context into every user turn (rather than stuffing it into the
     system prompt) means different questions can retrieve different chunks in
@@ -323,17 +354,34 @@ def _build_user_message(query: str, chunks: List[dict]) -> str:
     # overrides the model's tendency to refuse on indirect or short queries.
     top_score = chunks[0].get("score", 0.0) if chunks else 0.0
     confidence_hint = ""
-    if top_score >= _HIGH_CONFIDENCE_SCORE:
+    if force_answer or top_score >= _HIGH_CONFIDENCE_SCORE:
         confidence_hint = (
-            f"RETRIEVAL NOTE: Strong document match found (relevance score: "
-            f"{top_score:.2f}). The excerpts above contain relevant information. "
-            f"You MUST answer from these excerpts — do not refuse.\n\n"
+            f"RETRIEVAL NOTE: HIGH confidence (relevance score: {top_score:.2f}). "
+            f"The system has VERIFIED that the excerpts above contain relevant "
+            f"information. ANSWER REQUIRED: you are FORBIDDEN from issuing the "
+            f"refusal sentence. Answer every part of the question the excerpts "
+            f"support, with [Page N] citations. Apply the synonym and reframing "
+            f"rules (e.g. 'drawbacks' = 'when not to use' / 'limitations'). If a "
+            f"specific sub-aspect is genuinely not covered, answer the supported "
+            f"parts and add ONE line noting what is not covered (Rule 4) — but do "
+            f"NOT issue a full refusal.\n\n"
         )
     elif top_score >= 0.30:
         confidence_hint = (
             f"RETRIEVAL NOTE: Related content found (relevance score: "
             f"{top_score:.2f}). Attempt to answer from the excerpts; only refuse "
             f"if the specific detail asked is completely absent.\n\n"
+        )
+
+    # Second-attempt escalation (non-streaming retry after a HIGH-confidence refusal).
+    retry_hint = ""
+    if retry:
+        retry_hint = (
+            "ANSWER REQUIRED — SECOND ATTEMPT: Your previous response incorrectly "
+            "issued a refusal even though the excerpts contain relevant content. "
+            "Re-read the excerpts, apply the synonym/reframing rules, and provide "
+            "the supported answer now with [Page N] citations. Refusal is NOT "
+            "permitted.\n\n"
         )
 
     # ── Indirect-phrasing hint ───────────────────────────────────────────────
@@ -359,6 +407,7 @@ def _build_user_message(query: str, chunks: List[dict]) -> str:
         f"Citing any other page number is a critical error.\n\n"
         f"{context_block}\n"
         f"[END EXCERPTS]\n\n"
+        f"{retry_hint}"
         f"{reframing_hint}"
         f"{confidence_hint}"
         f"CITATION FORMAT: Always use [Page N] format inline. "
@@ -819,11 +868,18 @@ def _build_retrieval_query(query: str, history: List[dict]) -> str:
 
     # ── Step B: Enrich with keywords from last assistant response ────────────
     # Adds document vocabulary regardless of whether rewriting happened.
+    # IMPORTANT: skip enrichment when the previous answer was a refusal — its
+    # text ("I'm sorry, but the uploaded document does not contain information
+    # about …") would otherwise inject noise words like "sorry", "uploaded",
+    # "document", "contain", "information" into the next retrieval query and
+    # degrade recall for the follow-up.
     last_assistant = next(
         (t["content"] for t in reversed(history) if t["role"] == "assistant"),
         "",
     )
-    if last_assistant:
+    if last_assistant and is_refusal(last_assistant):
+        print("[agent] Enrichment SKIPPED: last answer was a refusal (avoiding query pollution).")
+    elif last_assistant:
         keywords = _extract_keywords(last_assistant, max_keywords=10)
         if keywords:
             kw_str = " ".join(keywords)
@@ -943,6 +999,30 @@ def _log_confidence(chunks: List[dict]) -> tuple[float, set]:
     return top_score, chunk_pages_set
 
 
+def _call_mistral(messages: List[dict], api_key: str) -> dict:
+    """
+    Blocking (non-streaming) Mistral chat completion. Returns the parsed JSON.
+
+    Factored out so get_answer() can issue a second, forced attempt when a
+    HIGH-confidence query is refused on the first pass.
+    """
+    response = requests.post(
+        MISTRAL_API_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": MAX_TOKENS,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def get_answer(
     query: str,
     session_id: str,
@@ -1023,16 +1103,29 @@ def get_answer(
     top_score, chunk_pages_set = _log_confidence(chunks)
 
     # ------------------------------------------------------------------
-    # Step 5: Build user message with embedded context
-    # NOTE: always uses the ORIGINAL query, never the rewritten retrieval query.
+    # Confidence-based refusal override
+    # When the top semantic match is HIGH (>= _HIGH_CONFIDENCE_SCORE), relevant
+    # content is genuinely present — a full refusal would be wrong. We inject a
+    # forcing directive into the user message and (below) retry once if the LLM
+    # still refuses. Refusals remain valid for zero-chunk (handled above) and
+    # MEDIUM/LOW confidence where the specific detail may truly be absent.
     # ------------------------------------------------------------------
-    user_message_content = _build_user_message(query, chunks)
+    force_answer = top_score >= _HIGH_CONFIDENCE_SCORE
+    if force_answer:
+        print("[agent] Refusal override: confidence HIGH, forcing evidence-based answer")
+
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "MISTRAL_API_KEY environment variable is not set. "
+            "Add it to your .env file."
+        )
 
     # ------------------------------------------------------------------
-    # Step 6: Compose the full message list
-    # System prompt first, then history, then current user turn.
-    # History roles ("user"/"assistant") pass through unchanged.
+    # Step 5-6: Build user message (with confidence forcing) + message list
+    # NOTE: always uses the ORIGINAL query, never the rewritten retrieval query.
     # ------------------------------------------------------------------
+    user_message_content = _build_user_message(query, chunks, force_answer=force_answer)
     messages_for_api = _build_messages_for_api(
         history=list(conversation_history),  # shallow copy — don't mutate caller's list
         current_user_content=user_message_content,
@@ -1041,37 +1134,36 @@ def get_answer(
     # ------------------------------------------------------------------
     # Step 7: Call Mistral API
     # ------------------------------------------------------------------
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "MISTRAL_API_KEY environment variable is not set. "
-            "Add it to your .env file."
-        )
-
     print(
         f"[agent] Calling {MODEL} via Mistral API | "
         f"chunks={len(chunks)} | "
         f"history_turns={len(conversation_history)} | "
-        f"top_chunk_score={chunks[0].get('score', 'n/a')}"
+        f"top_chunk_score={chunks[0].get('score', 'n/a')} | "
+        f"force_answer={force_answer}"
     )
 
-    response = requests.post(
-        MISTRAL_API_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "messages": messages_for_api,
-            "max_tokens": MAX_TOKENS,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-
-    data = response.json()
+    data = _call_mistral(messages_for_api, api_key)
     answer = data["choices"][0]["message"]["content"]
+
+    # HIGH-confidence refusal guard: if the model refused anyway, retry once
+    # with an explicit "previous attempt incorrectly refused" escalation.
+    if force_answer and is_refusal(answer):
+        print(
+            "[agent] Refusal override: HIGH confidence but LLM refused on first "
+            "attempt — retrying once with forced directive."
+        )
+        retry_content = _build_user_message(query, chunks, force_answer=True, retry=True)
+        retry_messages = _build_messages_for_api(
+            history=list(conversation_history),
+            current_user_content=retry_content,
+        )
+        data = _call_mistral(retry_messages, api_key)
+        retry_answer = data["choices"][0]["message"]["content"]
+        if is_refusal(retry_answer):
+            print("[agent] Refusal override: retry STILL refused — evidence likely insufficient.")
+        else:
+            print("[agent] Refusal override: retry produced an evidence-based answer.")
+        answer = retry_answer
 
     # ------------------------------------------------------------------
     # Step 8: Parse and validate citations
@@ -1080,8 +1172,6 @@ def get_answer(
     # _validate_citations then removes any page numbers not present in the
     # retrieved chunks — these are hallucinated citations the LLM invented
     # despite the CITATION CONSTRAINT injected into the user message.
-    # The response text is left unchanged; only the returned cited_pages
-    # list is sanitised so callers get a trustworthy page set.
     # ------------------------------------------------------------------
     cited_pages_raw = _extract_cited_pages(answer)
     cited_pages = _validate_citations(cited_pages_raw, chunk_pages_set)
@@ -1178,8 +1268,16 @@ def stream_answer(
 
     top_score, chunk_pages_set = _log_confidence(chunks)
 
+    # Confidence-based refusal override. Streaming cannot retry mid-stream once
+    # tokens have been flushed, so HIGH confidence forces the answer PRE-EMPTIVELY
+    # via the directive baked into the user message (the system-prompt Rule-3
+    # override keys on the "RETRIEVAL NOTE: HIGH / ANSWER REQUIRED" line).
+    force_answer = top_score >= _HIGH_CONFIDENCE_SCORE
+    if force_answer:
+        print("[agent] Refusal override: confidence HIGH, forcing evidence-based answer")
+
     # ── Steps 5-6: build the message list (shared helpers) ───────────────────
-    user_message_content = _build_user_message(query, chunks)
+    user_message_content = _build_user_message(query, chunks, force_answer=force_answer)
     messages_for_api = _build_messages_for_api(
         history=list(conversation_history),
         current_user_content=user_message_content,
