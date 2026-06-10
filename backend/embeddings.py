@@ -27,6 +27,15 @@ import re
 import time
 from typing import Dict, List, Optional
 
+# transformers (pulled in by sentence-transformers) auto-imports its TensorFlow
+# backend when TF is present in the environment. On Keras 3 that import crashes
+# ("install tf-keras"). This app is PyTorch-only, so disable the TF/Flax paths
+# BEFORE importing sentence_transformers — this both prevents the crash and
+# avoids loading TensorFlow into memory. Must be set before the import below;
+# it cannot live in .env because main.py loads .env after importing this module.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
@@ -76,6 +85,13 @@ _BM25_WEIGHT = 0.4
 # precision and shrinks the LLM prompt. Loaded lazily (NOT at startup).
 _CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _RERANK_TOP_K = 7
+
+# Cross-encoder reranking is the single largest memory cost (a second transformer
+# model loaded into RAM). On low-memory hosts (e.g. Render free tier, 512 MB) set
+# ENABLE_RERANKING=false: the CrossEncoder is never loaded and retrieval returns
+# the hybrid (BM25 + semantic) results directly. Default true preserves full
+# answer quality on hosts with enough RAM.
+ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Retrieval debug / observability (Phase 2.5)
@@ -555,8 +571,14 @@ def retrieve_relevant_chunks(
         print("[embeddings] Retrieved 0 chunk(s); top score=n/a.")
         return []
 
-    reranked = _rerank_candidates(query, candidates, final_k=_RERANK_TOP_K)
-    results = reranked[:top_k]
+    if ENABLE_RERANKING:
+        reranked = _rerank_candidates(query, candidates, final_k=_RERANK_TOP_K)
+        results = reranked[:top_k]
+    else:
+        # Low-memory mode: skip the CrossEncoder, return top hybrid candidates
+        # directly (already ordered by fused score) — same final chunk count.
+        print("[embeddings] Reranking disabled")
+        results = candidates[:_RERANK_TOP_K][:top_k]
 
     print(
         f"[embeddings] Retrieved {len(results)} chunk(s); "
@@ -700,8 +722,15 @@ def retrieve_multi_query(
         }
         return []
 
-    reranked = _rerank_candidates(rerank_query, merged_list, final_k=_RERANK_TOP_K)
-    results = reranked[:top_k]
+    if ENABLE_RERANKING:
+        reranked = _rerank_candidates(rerank_query, merged_list, final_k=_RERANK_TOP_K)
+        results = reranked[:top_k]
+    else:
+        # Low-memory mode: skip the CrossEncoder; the merged set is unordered, so
+        # sort by fused score before trimming to the same final chunk count.
+        print("[embeddings] Reranking disabled")
+        merged_sorted = sorted(merged_list, key=lambda c: c["fused_score"], reverse=True)
+        results = merged_sorted[:_RERANK_TOP_K][:top_k]
     print(f"After rerank:\n{len(results)} chunks")
 
     # Top sections (parity with single-query observability).
@@ -783,17 +812,18 @@ def delete_session(session_id: str) -> None:
 
 def warmup() -> None:
     """
-    Pre-initialize the embedding model and Qdrant client.
+    Initialize ONLY the Qdrant client at startup — no transformer models.
 
-    Called during application startup so the first upload does not bear the
-    cold-start penalty of loading the ~90 MB sentence-transformer model and
-    establishing the Qdrant connection.  Both operations are idempotent —
-    subsequent calls return the already-initialized singletons immediately.
+    Transformer models (the embedding model, and the cross-encoder when
+    ENABLE_RERANKING is true) are lazy-loaded on first use instead. Loading them
+    at startup pushes peak memory past the Render free-tier 512 MB limit and
+    OOM-kills the process before it can bind a port. Keeping startup model-free
+    lets the app boot on low-memory hosts; the first upload/query pays the
+    one-time model-load cost instead.
     """
-    print("[embeddings] Warmup: loading model and Qdrant client…")
-    _get_model()
+    print("[embeddings] Warmup: initializing Qdrant client only (models load lazily).")
     _get_client()
-    print("[embeddings] Warmup complete.")
+    print("[embeddings] Warmup complete — no transformer models loaded at startup.")
 
 
 def get_status() -> dict:

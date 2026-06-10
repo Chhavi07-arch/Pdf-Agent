@@ -120,16 +120,14 @@ async def _generate_summary_background(
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     """
-    Application lifespan: warm up heavy singletons at startup so the first
-    upload request does not bear the cold-start penalty.
+    Application lifespan: initialize lightweight singletons at startup.
 
-    Without warmup:
-      • First upload triggers model load (~30-60 s on Render free tier)
-      • Combined with embedding + Qdrant this can exceed Render's 60 s timeout
-
-    With warmup:
-      • Model and Qdrant client are ready before any request arrives
-      • First upload only pays for embed + Qdrant (~10-20 s typical)
+    Transformer models are intentionally NOT loaded here — only the Qdrant
+    client and configuration. Loading the embedding model (and the cross-encoder)
+    at startup pushes peak RAM past the Render free-tier 512 MB limit and
+    OOM-kills the process before it can bind a port. Models lazy-load on first
+    use instead, so the first upload/query pays a one-time cold-start cost while
+    startup stays memory-safe and deployable on low-memory instances.
     """
     api_key_status = "SET" if os.getenv("MISTRAL_API_KEY") else "*** NOT SET — /chat will fail ***"
     qdrant_url = os.getenv("QDRANT_URL", "").strip()
@@ -143,16 +141,17 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     print(f"  ALLOWED_ORIGINS : {ALLOWED_ORIGINS}")
     print("=" * 62)
 
-    # Pre-initialize the sentence-transformer model and Qdrant client.
-    # This moves the cold-start cost from the first /upload request to startup,
-    # where there is no user-facing timeout to worry about.
+    # Initialize ONLY the Qdrant client (no transformer models) to keep startup
+    # memory low. Models lazy-load on first use.
+    reranking = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
+    print(f"  ENABLE_RERANKING: {reranking} ({'cross-encoder will load on first query' if reranking else 'low-memory mode — cross-encoder NOT loaded'})")
     t_warmup = time.monotonic()
     try:
         await asyncio.to_thread(warmup)
-        print(f"[main] Warmup complete in {time.monotonic() - t_warmup:.1f}s — ready for requests.")
+        print(f"[main] Startup init complete in {time.monotonic() - t_warmup:.1f}s — ready for requests (models lazy-load).")
     except Exception as exc:
-        print(f"[main] WARNING: Warmup failed in {time.monotonic() - t_warmup:.1f}s: {exc!r}")
-        print("[main] Model/client will lazy-initialize on first request (higher first-upload latency).")
+        print(f"[main] WARNING: Startup init failed in {time.monotonic() - t_warmup:.1f}s: {exc!r}")
+        print("[main] Qdrant client will lazy-initialize on first request.")
 
     yield
     print("[main] Shutdown complete.")
