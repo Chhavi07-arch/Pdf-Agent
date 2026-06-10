@@ -228,6 +228,7 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
                 "text":        chunks[i]["text"],
                 "page":        chunks[i]["page"],
                 "chunk_index": chunks[i]["chunk_index"],
+                "section":     chunks[i].get("section", "Unknown"),
             },
         )
         for i in range(len(chunks))
@@ -523,6 +524,18 @@ def retrieve_relevant_chunks(
         f"[embeddings] Retrieved {len(results)} chunk(s); "
         f"top score={results[0]['score'] if results else 'n/a'}."
     )
+
+    # Debug-only observability: which sections the returned chunks came from.
+    if results:
+        top_sections: List[str] = []
+        for r in results:
+            sec = r.get("section", "Unknown")
+            if sec not in top_sections:
+                top_sections.append(sec)
+        print("[embeddings] Top sections:")
+        for sec in top_sections[:5]:
+            print(f"  - {sec}")
+
     return results
 
 

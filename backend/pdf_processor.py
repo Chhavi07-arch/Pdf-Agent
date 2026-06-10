@@ -20,7 +20,8 @@ Chunking strategy:
     straddled a boundary.
 """
 
-from typing import List
+import re
+from typing import List, Optional
 
 import fitz  # PyMuPDF
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -28,6 +29,77 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # Separator hierarchy: try coarser splits first, fall back to finer ones.
 # This keeps sentences whole unless absolutely necessary.
 _SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+
+# ---------------------------------------------------------------------------
+# Section-header detection (Step 3 — contextual section metadata)
+# ---------------------------------------------------------------------------
+#
+# Goal: tag each chunk with the document section it belongs to, as METADATA
+# only — chunk text is never modified, so embeddings and retrieval ranking are
+# unaffected. The section field is used for observability and can surface
+# structure to the UI / citations later.
+
+# Numbered heading: "1 Intro", "1. Adapter", "2.3 Forces" — requires text after
+# the number so bare page numbers ("8") are not mistaken for headings.
+_HEADING_NUMBERED_RE = re.compile(r"^\d+(\.\d+)*\.?\s+\S")
+# Keyword heading: "Chapter 1", "Section 2", "Part II", "Appendix A".
+_HEADING_KEYWORD_RE = re.compile(r"^(chapter|section|part|appendix)\b", re.IGNORECASE)
+
+# Default section before any heading is seen.
+_UNKNOWN_SECTION = "Unknown"
+
+
+def _normalize_heading(text: str) -> str:
+    """All-caps headings → Title Case for readability ('ADAPTER PATTERN' → 'Adapter Pattern')."""
+    return text.title() if text == text.upper() else text
+
+
+def _extract_section(line: str) -> Optional[str]:
+    """
+    Return a cleaned section name if `line` looks like a heading, else None.
+
+    A heading must be a SHORT line (< 60 chars) AND match one of:
+      1. Ends with ':'            → "Responsibilities:", "Drawbacks:"
+      2. ALL CAPS                 → "ADAPTER PATTERN", "DESIGN PRINCIPLES"
+      3. Numbered / keyword       → "1. Adapter", "2.3 Forces", "Chapter 1"
+      4. Guarded title-case line  → "Forces, Constraints, Goals", "Pitfalls"
+
+    The short-line requirement plus these signals keeps detection precise — a
+    generic short line alone is NOT treated as a heading (that would reset the
+    section on nearly every wrapped line).
+    """
+    s = line.strip()
+    if not s or len(s) >= 60:
+        return None
+
+    # 1. Ends with a colon
+    if s.endswith(":"):
+        name = s[:-1].strip()
+        return name or None
+
+    # 2. ALL CAPS (with at least two letters, not a sentence)
+    alpha = [c for c in s if c.isalpha()]
+    if len(alpha) >= 2 and s == s.upper() and not s.endswith((".", ",", ";")):
+        return _normalize_heading(s)
+
+    # 3. Numbered / chapter-section style
+    if _HEADING_NUMBERED_RE.match(s) or _HEADING_KEYWORD_RE.match(s):
+        return s
+
+    # 4. Guarded title-case heading: short, no terminal sentence punctuation,
+    #    ≤ 6 words, and either a single word or mostly-capitalized words.
+    words = s.split()
+    if (
+        1 <= len(words) <= 6
+        and s[0].isupper()
+        and not s.endswith((".", "!", "?", ",", ";"))
+        and not s.islower()
+    ):
+        cap_words = sum(1 for w in words if w[:1].isupper())
+        if len(words) == 1 or cap_words >= max(1, len(words) // 2):
+            return s
+
+    return None
 
 
 def parse_pdf(pdf_bytes: bytes) -> List[dict]:
@@ -108,8 +180,10 @@ def chunk_pages(
 
     Returns:
         Flat list of chunk dicts:
-            {"text": str, "page": int, "chunk_index": int}
+            {"text": str, "page": int, "chunk_index": int, "section": str}
         chunk_index is a global counter across all pages, 0-based.
+        section is the detected heading the chunk falls under (metadata only —
+        chunk text is never modified), or "Unknown" before any heading is seen.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -122,22 +196,59 @@ def chunk_pages(
 
     chunks: List[dict] = []
     chunk_index = 0
+    current_section = _UNKNOWN_SECTION  # persists across pages until a new heading
 
     for page_data in pages:
         page_num = page_data["page"]
-        # Split this page's text in isolation — cross-page chunks are never produced.
-        page_chunks = splitter.split_text(page_data["text"])
+        page_text = page_data["text"]
 
+        # ── 1. Detect headings and record their character offset in the page ──
+        headings: List[tuple] = []  # [(offset, section_name), ...] in reading order
+        offset = 0
+        for line in page_text.split("\n"):
+            name = _extract_section(line)
+            if name:
+                headings.append((offset, name))
+                print(f"[pdf_processor] Detected section: {name}")
+            offset += len(line) + 1  # +1 for the stripped '\n'
+
+        # ── 2. Split this page's text in isolation (chunking unchanged) ──────
+        page_chunks = splitter.split_text(page_text)
+
+        # ── 3. Assign each chunk the most recent heading at/before its start ──
+        cursor = 0
         for chunk_text in page_chunks:
-            if chunk_text:  # strip_whitespace=True handles leading/trailing, but guard anyway
-                chunks.append(
-                    {
-                        "text":        chunk_text,
-                        "page":        page_num,
-                        "chunk_index": chunk_index,
-                    }
-                )
-                chunk_index += 1
+            if not chunk_text:  # strip_whitespace=True handles ends, but guard anyway
+                continue
+
+            # Locate the chunk's start offset within the page text so we can map
+            # it to the section it falls under. Search by a short prefix to stay
+            # robust to the splitter's whitespace trimming.
+            probe = chunk_text[:40] if len(chunk_text) >= 40 else chunk_text
+            pos = page_text.find(probe, cursor)
+            if pos == -1:
+                pos = page_text.find(chunk_text[:20], cursor)
+            start = pos if pos != -1 else cursor
+            if pos != -1:
+                cursor = pos + 1
+
+            # Advance current_section through any headings at/before this start.
+            for h_off, h_name in headings:
+                if h_off <= start:
+                    current_section = h_name
+                else:
+                    break
+
+            chunks.append(
+                {
+                    "text":        chunk_text,
+                    "page":        page_num,
+                    "chunk_index": chunk_index,
+                    "section":     current_section,
+                }
+            )
+            print(f"[pdf_processor] Chunk assigned to section: {current_section}")
+            chunk_index += 1
 
     print(f"[pdf_processor] Created {len(chunks)} chunk(s) from {len(pages)} page(s).")
     return chunks
