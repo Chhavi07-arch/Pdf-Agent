@@ -16,7 +16,7 @@ from typing import Iterator, List, Optional
 
 import requests # type: ignore
 
-from embeddings import retrieve_relevant_chunks
+from embeddings import retrieve_multi_query, retrieve_relevant_chunks
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -25,6 +25,15 @@ from embeddings import retrieve_relevant_chunks
 MODEL = "mistral-small-latest"
 MAX_TOKENS = 1024
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+
+# When True, each query is diversified into 2 alternative phrasings and all
+# formulations are retrieved, merged, and reranked together (Phase 3 Step 1).
+# Falls back to single-query retrieval if variant generation fails.
+#
+# Disabled by default because evaluation on the Adapter PDF increased refusal
+# rate and latency. The implementation is kept intact (generate_query_variants,
+# retrieve_multi_query) and re-enables by flipping this flag back to True.
+ENABLE_MULTI_QUERY = False
 
 # The prefix used for every out-of-scope refusal.
 # is_refusal() matches on this exact string, so keep it in sync.
@@ -39,6 +48,31 @@ REFUSAL_PREFIX = (
 _SYSTEM_PROMPT = """\
 You are a precise document assistant. Your only function is to answer questions \
 using the text excerpts from an uploaded PDF that are provided to you in each message.
+
+## EVIDENCE-BASED ANSWERING POLICY (read first — governs the rules below)
+
+Your default posture is to ANSWER from the provided excerpts — conservatively and
+with citations — not to refuse. Decide using ONLY the excerpts in the user message:
+
+1. Evidence present (the excerpts address the question):
+   → Answer. State ONLY what the excerpts support, each claim cited with [Page N].
+     Never add anything that is not in the excerpts.
+
+2. Evidence partial (the excerpts cover part of the question, OR a closely related
+   concept under different wording — e.g. "drawbacks" ↔ "when not to use",
+   "ratings normalized" ↔ "units and ranges / 0..100 ↔ 0..5"):
+   → Answer the supported part with citations, then add ONE line:
+     "Note: The document does not explicitly address [the specific missing aspect]."
+   → Do NOT refuse merely because the wording differs or only part is covered.
+
+3. Evidence genuinely absent (nothing in the excerpts relates, even after applying
+   the Semantic Equivalence and Concept Reframing rules below):
+   → Issue the exact refusal sentence (Rule 3).
+
+Refusing when relevant evidence is present is a critical failure. When unsure
+between "partial" and "absent", choose PARTIAL — answer what is supported and flag
+the gap. This policy NEVER licenses information from outside the excerpts: answering
+conservatively means answering with less, not inventing more.
 
 ## STRICT RULES — violating any rule is a critical failure
 
@@ -553,6 +587,74 @@ def _expand_query(query: str, chunks_context: str = "") -> str:
     return f"{query} {' '.join(added)}" if added else query
 
 
+def generate_query_variants(query: str) -> List[str]:
+    """
+    Generate up to 2 alternative phrasings of the user's question to diversify
+    retrieval (one concise, one descriptive).
+
+    Calls Mistral with a small, deterministic-ish prompt. Returns [] on any
+    failure or if the API key is missing — callers then fall back to the
+    existing single-query retrieval, so multi-query never breaks retrieval.
+
+    Args:
+        query: The user's original natural-language question.
+
+    Returns:
+        A list of up to 2 distinct variant strings (never includes the original).
+    """
+    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    prompt = (
+        "Generate exactly 2 alternative document-search queries for the user's "
+        "question.\n\n"
+        "Rules:\n"
+        "- Preserve meaning\n"
+        "- Use different wording\n"
+        "- One query should be concise\n"
+        "- One query should be descriptive\n\n"
+        "Return exactly 2 lines.\n"
+        "No numbering.\n"
+        "No explanations.\n\n"
+        f"User Question:\n{query}"
+    )
+
+    try:
+        resp = requests.post(
+            MISTRAL_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 120,
+                "temperature": 0.3,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+        variants: List[str] = []
+        for line in raw.split("\n"):
+            # Defensive: strip any stray bullets/numbering the model may add.
+            cleaned = line.strip().lstrip("-*0123456789.) ").strip()
+            if not cleaned or cleaned.lower() == query.strip().lower():
+                continue
+            if cleaned not in variants:
+                variants.append(cleaned)
+            if len(variants) >= 2:
+                break
+        return variants
+
+    except Exception as exc:
+        print(f"[agent] Query variant generation failed: {exc!r} — single-query fallback.")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Conversational retrieval helpers
 # ---------------------------------------------------------------------------
@@ -960,21 +1062,54 @@ def _run_retrieval(
         print(f"[agent] Synonym expansion applied.")
     print(f"[agent] Final retrieval query (len={len(expanded_query)}): {expanded_query!r}")
 
-    # Step 3: Retrieve — layered fallback strategy
-    chunks = retrieve_relevant_chunks(expanded_query, session_id, top_k=10)
+    # Step 2.5: Multi-query diversification (Phase 3 Step 1).
+    # Generate 2 alternative phrasings and retrieve all formulations together.
+    # The query set is a SUPERSET of the single-query (expanded_query is always
+    # included), so recall cannot regress. Falls back to single-query if variant
+    # generation fails or yields nothing.
+    if ENABLE_MULTI_QUERY:
+        variants = generate_query_variants(query)
+        if variants:
+            print("[multi-query]")
+            print(f"Original:\n{query}")
+            for i, v in enumerate(variants, start=1):
+                print(f"Variant {i}:\n{v}")
+            query_set = [expanded_query] + [_expand_query(v) for v in variants]
+            chunks = retrieve_multi_query(
+                query_set, session_id, top_k=10, original_query=query
+            )
+            if chunks:
+                return chunks
+            print("[agent] Multi-query returned no chunks — falling back to single-query.")
+        else:
+            print("[agent] Multi-query: no variants generated — using single-query.")
+
+    # Step 3: Retrieve — layered fallback strategy (also the multi-query fallback).
+    # original_query is passed for retrieval diagnostics only (Query vs Rewritten
+    # Query in the debug block); it does not affect retrieval behavior.
+    chunks = retrieve_relevant_chunks(expanded_query, session_id, top_k=10, original_query=query)
 
     if not chunks:
         print(f"[agent] Fallback 1: retrieval query without expansion.")
-        chunks = retrieve_relevant_chunks(retrieval_query, session_id, top_k=10)
+        chunks = retrieve_relevant_chunks(retrieval_query, session_id, top_k=10, original_query=query)
 
     if not chunks and retrieval_query != query:
         print(f"[agent] Fallback 2: original user query.")
         expanded_original = _expand_query(query)
-        chunks = retrieve_relevant_chunks(expanded_original, session_id, top_k=10)
+        chunks = retrieve_relevant_chunks(expanded_original, session_id, top_k=10, original_query=query)
         if not chunks:
-            chunks = retrieve_relevant_chunks(query, session_id, top_k=10)
+            chunks = retrieve_relevant_chunks(query, session_id, top_k=10, original_query=query)
 
     return chunks
+
+
+def _confidence_band(top_score: float) -> str:
+    """Map a top cosine score to its confidence band (thresholds unchanged)."""
+    if top_score >= _HIGH_CONFIDENCE_SCORE:
+        return "HIGH"
+    if top_score >= 0.30:
+        return "MEDIUM"
+    return "LOW"
 
 
 def _log_confidence(chunks: List[dict]) -> tuple[float, set]:
@@ -985,12 +1120,7 @@ def _log_confidence(chunks: List[dict]) -> tuple[float, set]:
     """
     top_score = chunks[0].get("score", 0.0)
     chunk_pages_set = {c["page"] for c in chunks}
-    if top_score >= _HIGH_CONFIDENCE_SCORE:
-        confidence_label = "HIGH"
-    elif top_score >= 0.30:
-        confidence_label = "MEDIUM"
-    else:
-        confidence_label = "LOW"
+    confidence_label = _confidence_band(top_score)
     print(
         f"[agent] Retrieval confidence: {confidence_label} "
         f"(top_score={top_score:.4f}, chunks={len(chunks)}, "
@@ -1193,6 +1323,13 @@ def get_answer(
         f"{usage.get('completion_tokens', '?')}out"
     )
 
+    # Answer-quality audit block: correlates retrieval strength with the LLM's
+    # final decision so HIGH-confidence-but-refused cases are easy to spot.
+    print("[agent]")
+    print(f"retrieval_confidence={_confidence_band(top_score)}")
+    print(f"chunks_found={len(chunks)}")
+    print(f"llm_decision={'refusal' if _refusal else 'answer'}")
+
     return {
         "answer": answer,
         "cited_pages": cited_pages,
@@ -1351,6 +1488,12 @@ def stream_answer(
         f"cited_pages_raw={cited_pages_raw} | cited_pages_valid={cited_pages} | "
         f"chars={len(answer)}"
     )
+
+    # Answer-quality audit block (same as non-streaming path).
+    print("[agent]")
+    print(f"retrieval_confidence={_confidence_band(top_score)}")
+    print(f"chunks_found={len(chunks)}")
+    print(f"llm_decision={'refusal' if refusal else 'answer'}")
 
     yield _ndjson({
         "type": "done",

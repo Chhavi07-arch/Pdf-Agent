@@ -263,6 +263,14 @@ export default function PDFUploader({
 // ── PDF card in the list ──────────────────────────────────────────────────────
 
 function PdfCard({ pdf, isActive, onSwitch, onDelete }) {
+  const [expanded, setExpanded] = useState(false)
+  const SUMMARY_LIMIT = 140
+  const summary = pdf.summary
+  const isLong = typeof summary === 'string' && summary.length > SUMMARY_LIMIT
+  const shownSummary = !isLong || expanded
+    ? summary
+    : summary.slice(0, SUMMARY_LIMIT).trimEnd() + '…'
+
   return (
     <div
       onClick={onSwitch}
@@ -299,6 +307,43 @@ function PdfCard({ pdf, isActive, onSwitch, onDelete }) {
           <p className="text-xs mt-0.5" style={{color: '#64748b'}}>{pdf.chunkCount} sections indexed</p>
         </div>
       </div>
+
+      {/* Document summary (generated server-side; collapsible if long) */}
+      {summary === undefined && (
+        <p style={{fontSize: '11px', fontStyle: 'italic', color: '#64748b', marginTop: '8px'}}>
+          Generating summary…
+        </p>
+      )}
+      {typeof summary === 'string' && summary.length > 0 && (
+        <div
+          style={{
+            marginTop: '8px',
+            paddingTop: '8px',
+            borderTop: '1px solid rgba(139, 92, 246, 0.15)',
+          }}
+        >
+          <p style={{
+            fontSize: '10px', fontWeight: 700, letterSpacing: '0.06em',
+            textTransform: 'uppercase', color: '#a78bfa', marginBottom: '4px',
+          }}>
+            Summary
+          </p>
+          <p style={{fontSize: '11px', lineHeight: 1.5, color: '#94a3b8'}}>
+            {shownSummary}
+          </p>
+          {isLong && (
+            <button
+              onClick={e => { e.stopPropagation(); setExpanded(v => !v) }}
+              style={{
+                fontSize: '10px', color: '#a78bfa', marginTop: '4px',
+                background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+              }}
+            >
+              {expanded ? 'Show less' : 'Show more'}
+            </button>
+          )}
+        </div>
+      )}
 
       <button
         onClick={e => { e.stopPropagation(); onDelete() }}

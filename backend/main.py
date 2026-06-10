@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 from agent import get_answer, is_refusal, stream_answer
 from embeddings import check_qdrant_connectivity, delete_session as _delete_session
-from embeddings import embed_and_store, get_status, warmup
+from embeddings import embed_and_store, get_last_retrieval_debug, get_status, warmup
 from pdf_processor import parse_and_chunk
 from summarizer import format_summary_answer, generate_doc_summary, is_document_level_query
 
@@ -560,6 +560,66 @@ async def chat_stream(request: ChatRequest):
                 )
 
     return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
+
+
+@app.get("/debug/retrieval/{session_id}", summary="Latest retrieval diagnostics")
+async def debug_retrieval(session_id: str):
+    """
+    Return the most recent retrieval diagnostics captured for a session
+    (query, rewritten query, candidate counts, top scores, and per-chunk
+    semantic/bm25/fused/rerank scores). Observability only.
+
+    Raises:
+        404: session_id not found.
+    """
+    if session_id not in sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    diagnostics = get_last_retrieval_debug(session_id)
+    return {
+        "session_id":  session_id,
+        "diagnostics": diagnostics,
+        "message":     None if diagnostics else "No retrieval has run for this session yet.",
+    }
+
+
+@app.get("/session/{session_id}", summary="Session metadata + document summary")
+async def get_session(session_id: str):
+    """
+    Return session metadata including the pre-generated document summary.
+
+    The summary is produced by a background task shortly after upload (see
+    summarizer.generate_doc_summary), so immediately after /upload the "summary"
+    field may still be null — the frontend polls until it is populated.
+
+    This endpoint only EXPOSES the existing summary; it does not generate it.
+
+    Raises:
+        404: session_id not found.
+    """
+    if session_id not in sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+
+    meta = sessions[session_id]
+    doc = meta.get("doc_summary")
+
+    return {
+        "session_id":  session_id,
+        "filename":    meta["filename"],
+        "chunk_count": meta["chunk_count"],
+        "status":      meta.get("status", "ready"),
+        "summary":     doc.get("summary") if doc else None,
+        "summary_meta": {
+            "title":         doc.get("title"),
+            "topics":        doc.get("topics"),
+            "document_type": doc.get("document_type"),
+        } if doc else None,
+    }
 
 
 @app.get("/session/{session_id}/status", summary="Session indexing status")

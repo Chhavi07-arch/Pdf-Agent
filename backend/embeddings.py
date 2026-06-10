@@ -39,6 +39,13 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 VECTOR_SIZE = 384  # all-MiniLM-L6-v2 output dimensionality
 
+# TODO:
+# Qdrant currently serves as the vector store.
+#
+# If future requirements demand a relational database solution, migration can be
+# performed using pgvector by replacing vector insert/search operations while
+# preserving retrieval interfaces.
+
 # Default minimum cosine similarity score for a chunk to be included in results.
 # Chunks scoring below this threshold are filtered before the LLM sees them.
 # Rationale:
@@ -69,6 +76,25 @@ _BM25_WEIGHT = 0.4
 # precision and shrinks the LLM prompt. Loaded lazily (NOT at startup).
 _CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _RERANK_TOP_K = 7
+
+# ---------------------------------------------------------------------------
+# Retrieval debug / observability (Phase 2.5)
+# ---------------------------------------------------------------------------
+
+# When True, every retrieval prints a consolidated [retrieval] diagnostics block
+# (candidate counts, top scores, per-chunk semantic/bm25/fused/rerank scores).
+# Observability only — does not affect retrieval behavior.
+DEBUG_RETRIEVAL = True
+
+# Latest diagnostics per session, captured on every retrieve_relevant_chunks
+# call regardless of DEBUG_RETRIEVAL, so GET /debug/retrieval/{id} can serve it.
+#   session_id -> diagnostics dict
+_last_retrieval_debug: Dict[str, dict] = {}
+
+# Side-channel stats written by _hybrid_search on each call (candidate counts +
+# hybrid top score) so retrieve_relevant_chunks can include them in diagnostics
+# without changing _hybrid_search's return contract.
+_last_hybrid_stats: Dict[str, object] = {}
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (lazy-initialized on first use)
@@ -381,6 +407,10 @@ def _hybrid_search(
     if not semantic_kept:
         # No relevant semantic content → preserve the existing fast-refusal path.
         print("[embeddings] No semantic candidates above threshold — hybrid empty (refusal path).")
+        _last_hybrid_stats.clear()
+        _last_hybrid_stats.update(
+            {"semantic_candidates": 0, "bm25_candidates": 0, "hybrid_top_score": None}
+        )
         return []
 
     bm25 = _bm25_search(query, session_id, pool_size)
@@ -417,6 +447,13 @@ def _hybrid_search(
     print(f"[embeddings] Hybrid candidates={len(fused)}")
     if fused:
         print(f"[embeddings] Hybrid top score={fused[0]['fused_score']}")
+
+    _last_hybrid_stats.clear()
+    _last_hybrid_stats.update({
+        "semantic_candidates": len(semantic_kept),
+        "bm25_candidates":     len(bm25),
+        "hybrid_top_score":    fused[0]["fused_score"] if fused else None,
+    })
     return fused
 
 
@@ -481,6 +518,7 @@ def retrieve_relevant_chunks(
     query: str,
     session_id: str,
     top_k: int = 10,
+    original_query: Optional[str] = None,
 ) -> List[dict]:
     """
     Retrieve the most relevant chunks: hybrid (BM25 + semantic) → cross-encoder rerank.
@@ -536,6 +574,181 @@ def retrieve_relevant_chunks(
         for sec in top_sections[:5]:
             print(f"  - {sec}")
 
+    # ── Capture consolidated retrieval diagnostics (Phase 2.5) ───────────────
+    diagnostics = {
+        "query":                original_query if original_query is not None else query,
+        "rewritten_query":      query,
+        "semantic_candidates":  _last_hybrid_stats.get("semantic_candidates", 0),
+        "bm25_candidates":      _last_hybrid_stats.get("bm25_candidates", 0),
+        "hybrid_top_score":     _last_hybrid_stats.get("hybrid_top_score"),
+        "rerank_top_score":     results[0].get("rerank_score") if results else None,
+        "chunks": [
+            {
+                "rank":           i + 1,
+                "page":           r["page"],
+                "section":        r.get("section", "Unknown"),
+                "semantic_score": r.get("semantic_score"),
+                "bm25_score":     r.get("bm25_score"),
+                "fused_score":    r.get("fused_score"),
+                "rerank_score":   r.get("rerank_score"),
+            }
+            for i, r in enumerate(results)
+        ],
+    }
+    _last_retrieval_debug[session_id] = diagnostics
+    if DEBUG_RETRIEVAL:
+        _print_retrieval_debug(diagnostics)
+
+    return results
+
+
+def _fmt(value) -> str:
+    """Format a numeric diagnostic value for the debug block ('n/a' if None)."""
+    return f"{value:.2f}" if isinstance(value, (int, float)) else "n/a"
+
+
+def _print_retrieval_debug(diag: dict) -> None:
+    """Print the consolidated [retrieval] diagnostics block (DEBUG_RETRIEVAL)."""
+    print("[retrieval]")
+    print(f"Query: {diag['query']}")
+    if diag["rewritten_query"] != diag["query"]:
+        print(f"Rewritten Query: {diag['rewritten_query']}")
+    print(f"Semantic Candidates: {diag['semantic_candidates']}")
+    print(f"BM25 Candidates: {diag['bm25_candidates']}")
+    print(f"Hybrid Top Score: {_fmt(diag['hybrid_top_score'])}")
+    print(f"Rerank Top Score: {_fmt(diag['rerank_top_score'])}")
+    for c in diag["chunks"]:
+        print(f"\n#{c['rank']}")
+        print(f"Page: {c['page']}")
+        print(f"Section: {c['section']}")
+        print(f"Semantic: {_fmt(c['semantic_score'])}")
+        print(f"BM25: {_fmt(c['bm25_score'])}")
+        print(f"Fused: {_fmt(c['fused_score'])}")
+        print(f"Rerank: {_fmt(c['rerank_score'])}")
+
+
+def get_last_retrieval_debug(session_id: str) -> Optional[dict]:
+    """Return the most recent retrieval diagnostics for a session, or None."""
+    return _last_retrieval_debug.get(session_id)
+
+
+def retrieve_multi_query(
+    queries: List[str],
+    session_id: str,
+    top_k: int = 10,
+    original_query: Optional[str] = None,
+) -> List[dict]:
+    """
+    Multi-query retrieval (Phase 3 Step 1).
+
+    Runs the existing hybrid search for several query formulations, merges and
+    deduplicates the fused candidates (keeping the highest fused score per
+    chunk), then applies the SAME cross-encoder reranker ONCE.
+
+    This only ADDS a fan-out + merge layer; _hybrid_search and
+    _rerank_candidates are reused unchanged. Reranking uses original_query (the
+    user's actual question) so relevance is judged against true intent, not a
+    paraphrase. Returns up to top_k reranked chunks, or [] if every query was
+    gated out by the semantic threshold (preserving the refusal fast-path).
+
+    Pipeline:
+        queries → _hybrid_search (each) → merge/dedup by chunk_index
+                → _rerank_candidates (once) → top_k
+
+    Args:
+        queries:        Query formulations to search (e.g. [expanded_original,
+                        variant1, variant2]).
+        session_id:     UUID identifying the active upload session.
+        top_k:          Maximum number of reranked chunks to return.
+        original_query: The user's question, used for reranking + diagnostics.
+
+    Returns:
+        List of reranked chunk dicts (same schema as retrieve_relevant_chunks).
+    """
+    merged: Dict[int, dict] = {}
+    total_retrieved = 0
+    for q in queries:
+        candidates = _hybrid_search(q, session_id, pool_size=_CANDIDATE_POOL)
+        total_retrieved += len(candidates)
+        for c in candidates:
+            idx = c["chunk_index"]
+            # Deduplicate by chunk_index, keeping the highest fused score.
+            if idx not in merged or c["fused_score"] > merged[idx]["fused_score"]:
+                merged[idx] = c
+
+    merged_list = list(merged.values())
+    print(f"Retrieved:\n{total_retrieved} chunks")
+    print(f"Merged:\n{len(merged_list)} chunks")
+
+    rerank_query = original_query or (queries[0] if queries else "")
+
+    if not merged_list:
+        # Every formulation gated out → preserve the refusal fast-path.
+        print("After rerank:\n0 chunks")
+        _last_retrieval_debug[session_id] = {
+            "query":               rerank_query,
+            "rewritten_query":     " | ".join(queries),
+            "multi_query":         True,
+            "num_queries":         len(queries),
+            "retrieved":           total_retrieved,
+            "merged":              0,
+            "semantic_candidates": None,
+            "bm25_candidates":     None,
+            "hybrid_top_score":    None,
+            "rerank_top_score":    None,
+            "chunks":              [],
+        }
+        return []
+
+    reranked = _rerank_candidates(rerank_query, merged_list, final_k=_RERANK_TOP_K)
+    results = reranked[:top_k]
+    print(f"After rerank:\n{len(results)} chunks")
+
+    # Top sections (parity with single-query observability).
+    if results:
+        top_sections: List[str] = []
+        for r in results:
+            sec = r.get("section", "Unknown")
+            if sec not in top_sections:
+                top_sections.append(sec)
+        print("[embeddings] Top sections:")
+        for sec in top_sections[:5]:
+            print(f"  - {sec}")
+
+    # Capture diagnostics for GET /debug/retrieval and DEBUG_RETRIEVAL block.
+    hybrid_top = max((c["fused_score"] for c in merged_list), default=None)
+    diagnostics = {
+        "query":               rerank_query,
+        "rewritten_query":     " | ".join(queries),
+        "multi_query":         True,
+        "num_queries":         len(queries),
+        "retrieved":           total_retrieved,
+        "merged":              len(merged_list),
+        "semantic_candidates": None,  # aggregated across formulations; see 'retrieved'
+        "bm25_candidates":     None,
+        "hybrid_top_score":    hybrid_top,
+        "rerank_top_score":    results[0].get("rerank_score") if results else None,
+        "chunks": [
+            {
+                "rank":           i + 1,
+                "page":           r["page"],
+                "section":        r.get("section", "Unknown"),
+                "semantic_score": r.get("semantic_score"),
+                "bm25_score":     r.get("bm25_score"),
+                "fused_score":    r.get("fused_score"),
+                "rerank_score":   r.get("rerank_score"),
+            }
+            for i, r in enumerate(results)
+        ],
+    }
+    _last_retrieval_debug[session_id] = diagnostics
+    if DEBUG_RETRIEVAL:
+        _print_retrieval_debug(diagnostics)
+
+    print(
+        f"[embeddings] Multi-query retrieved {len(results)} chunk(s); "
+        f"top score={results[0]['score'] if results else 'n/a'}."
+    )
     return results
 
 
@@ -553,6 +766,7 @@ def delete_session(session_id: str) -> None:
     # Drop the in-memory BM25 index regardless of Qdrant state.
     if _bm25_indexes.pop(session_id, None) is not None:
         print(f"[embeddings] Dropped BM25 index for session '{session_id}'.")
+    _last_retrieval_debug.pop(session_id, None)
 
     if not client.collection_exists(collection_name=session_id):
         print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
