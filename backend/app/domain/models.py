@@ -125,6 +125,18 @@ class DocSummary:
 
 
 @dataclass
+class Session:
+    """Metadata for one uploaded-PDF chat session."""
+
+    session_id: str
+    filename: str
+    chunk_count: int
+    created_at: str
+    status: str = "ready"
+    doc_summary: Optional[DocSummary] = None
+
+
+@dataclass
 class ChatResult:
     """The outcome of answering one user turn."""
 
