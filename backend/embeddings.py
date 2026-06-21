@@ -17,7 +17,8 @@ raises ConfigError / QdrantUnavailableError, surfaced by the API as
 from __future__ import annotations
 
 import gc
-from typing import List, Optional
+import uuid
+from typing import List, Optional, Set
 
 from app import container
 from app.config import VECTOR_SIZE
@@ -103,6 +104,35 @@ def delete_session(session_id: str) -> None:
     container.retriever().drop_debug(session_id)
     container.store().delete_collection(session_id)
     print(f"[embeddings] Deleted Qdrant collection '{session_id}'.")
+
+
+def purge_orphan_collections(keep_ids: Set[str]) -> int:
+    """
+    Delete session collections (UUID-named) that no live session references.
+
+    Because session metadata lives in process memory, after a restart there are
+    no live sessions and every existing collection is orphaned (unreachable via
+    the API). Sweeping them prevents unbounded Qdrant growth. Only UUID-named
+    collections are touched, so any non-session collection on the cluster is left
+    alone. Returns the number of collections deleted.
+
+    Raises:
+        ConfigError / QdrantUnavailableError: if Qdrant is unconfigured/unreachable.
+    """
+    store = container.store()
+    deleted = 0
+    for name in store.list_collections():
+        if name in keep_ids:
+            continue
+        try:
+            uuid.UUID(str(name))  # only sweep session-style (UUID) collections
+        except ValueError:
+            continue
+        store.delete_collection(name)
+        deleted += 1
+    if deleted:
+        print(f"[embeddings] Purged {deleted} orphan collection(s) with no live session.")
+    return deleted
 
 
 def warmup() -> None:

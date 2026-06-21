@@ -92,6 +92,13 @@ class QdrantVectorStore(VectorStore):
         except _QDRANT_ERRORS as exc:
             raise QdrantUnavailableError(f"Qdrant delete failed: {exc!r}") from exc
 
+    def list_collections(self) -> List[str]:
+        client = self._get()
+        try:
+            return [c.name for c in client.get_collections().collections]
+        except _QDRANT_ERRORS as exc:
+            raise QdrantUnavailableError(f"Qdrant list collections failed: {exc!r}") from exc
+
     # ── data ─────────────────────────────────────────────────────────────────
     def upsert(
         self,

@@ -30,6 +30,10 @@ class VectorStore(ABC):
         """Drop a collection if present (no-op if absent)."""
 
     @abstractmethod
+    def list_collections(self) -> List[str]:
+        """Return the names of all collections in the store."""
+
+    @abstractmethod
     def upsert(
         self,
         name: str,

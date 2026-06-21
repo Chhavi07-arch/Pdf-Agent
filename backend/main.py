@@ -39,7 +39,7 @@ from app import container
 from app.domain.models import DocSummary, Session
 from app.errors import ConfigError, QdrantUnavailableError
 from embeddings import check_qdrant_connectivity, delete_session as _delete_session
-from embeddings import embed_and_store, get_last_retrieval_debug, get_status, warmup
+from embeddings import embed_and_store, get_last_retrieval_debug, get_status, purge_orphan_collections, warmup
 from pdf_processor import parse_and_chunk
 from summarizer import format_summary_answer, generate_doc_summary, is_document_level_query
 
@@ -158,6 +158,18 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         print(f"[main] WARNING: Startup init failed in {time.monotonic() - t_warmup:.1f}s: {exc!r}")
         print("[main] Qdrant client will lazy-initialize on first request.")
+
+    # Orphan sweep: at startup there are no live sessions (session state is
+    # in-memory), so every existing Qdrant collection is orphaned and unreachable
+    # via the API. Delete them to prevent unbounded growth across restarts.
+    # Disable with PURGE_ORPHANS_ON_STARTUP=false.
+    if os.getenv("PURGE_ORPHANS_ON_STARTUP", "true").lower() == "true":
+        try:
+            keep: set[str] = set()  # no live sessions exist at startup
+            n = await asyncio.to_thread(purge_orphan_collections, keep)
+            print(f"[main] Orphan sweep: removed {n} stale collection(s) with no live session.")
+        except Exception as exc:
+            print(f"[main] Orphan sweep skipped (non-fatal): {exc!r}")
 
     yield
     print("[main] Shutdown complete.")
