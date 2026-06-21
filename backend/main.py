@@ -35,6 +35,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent import get_answer, is_refusal, stream_answer
+from app import container
+from app.domain.models import DocSummary, Session
 from app.errors import ConfigError, QdrantUnavailableError
 from embeddings import check_qdrant_connectivity, delete_session as _delete_session
 from embeddings import embed_and_store, get_last_retrieval_debug, get_status, warmup
@@ -60,14 +62,13 @@ ALLOWED_ORIGINS: list[str] = os.getenv(
 ).split(",")
 
 # ---------------------------------------------------------------------------
-# In-memory session state
+# Session state — owned by repositories from the composition root (container).
+# Process-local (assessment scope); a production system would back these with
+# Redis or a database without touching the routes below.
 # ---------------------------------------------------------------------------
 
-# session_id -> {"filename", "chunk_count", "created_at", "doc_summary"}
-sessions: dict[str, dict] = {}
-
-# session_id -> list[{"role": "user"|"assistant", "content": str}]
-histories: dict[str, list[dict]] = {}
+_sessions = container.session_repo()
+_histories = container.history_repo()
 
 # ---------------------------------------------------------------------------
 # Background task: summary generation after upload response is sent
@@ -99,11 +100,11 @@ async def _generate_summary_background(
         doc_summary = await asyncio.to_thread(generate_doc_summary, chunks, filename, api_key)
         elapsed = time.monotonic() - t0
 
-        if session_id not in sessions:
+        if not _sessions.exists(session_id):
             print(f"[main] BG summary: session {session_id} was deleted before task completed — discarding.")
             return
 
-        sessions[session_id]["doc_summary"] = doc_summary
+        _sessions.set_summary(session_id, DocSummary.from_dict(doc_summary) if doc_summary else None)
         if doc_summary:
             print(
                 f"[main] BG summary: stored in {elapsed:.1f}s | "
@@ -141,7 +142,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     print("  PDF-Constrained Conversational Agent")
     print("  ─────────────────────────────────────────────────────────")
     print(f"  MISTRAL_API_KEY : {api_key_status}")
-    print(f"  QDRANT_URL      : {'SET → Cloud mode' if qdrant_url else 'not set → :memory: mode'}")
+    print(f"  QDRANT_URL      : {'SET → Qdrant server mode' if qdrant_url else '*** NOT SET — Qdrant is required; requests will fail ***'}")
     print(f"  MAX_PDF_SIZE_MB : {MAX_PDF_SIZE_MB}")
     print(f"  ALLOWED_ORIGINS : {ALLOWED_ORIGINS}")
     print("=" * 62)
@@ -204,7 +205,7 @@ async def root():
 @app.get("/health", summary="Liveness probe")
 async def health():
     """Lightweight liveness probe used by Render and the frontend."""
-    return {"status": "ok", "active_sessions": len(sessions)}
+    return {"status": "ok", "active_sessions": _sessions.count()}
 
 
 @app.get("/health/debug", summary="Detailed system status")
@@ -236,7 +237,7 @@ async def health_debug():
         "qdrant_client":    "initialized" if emb_status["client_initialized"] else "not_initialized",
         "qdrant_ping":      qdrant_ping,
         "mistral_key":      "set" if os.getenv("MISTRAL_API_KEY") else "MISSING",
-        "active_sessions":  len(sessions),
+        "active_sessions":  _sessions.count(),
     }
 
 
@@ -349,14 +350,17 @@ async def upload_pdf(
 
     # ── Persist session (summary populated by background task) ────────────────
 
-    sessions[session_id] = {
-        "filename":    filename,
-        "chunk_count": len(chunks),
-        "created_at":  datetime.now(timezone.utc).isoformat(),
-        "status":      "ready",  # embed is synchronous — session only exists once indexed
-        "doc_summary": None,     # filled in by _generate_summary_background
-    }
-    histories[session_id] = []
+    _sessions.add(
+        Session(
+            session_id=session_id,
+            filename=filename,
+            chunk_count=len(chunks),
+            created_at=datetime.now(timezone.utc).isoformat(),
+            status="ready",       # embed is synchronous — session only exists once indexed
+            doc_summary=None,     # filled in by _generate_summary_background
+        )
+    )
+    _histories.init(session_id)
 
     # ── Stage 3: Queue summary generation (runs AFTER response is sent) ───────
 
@@ -394,7 +398,8 @@ async def chat(request: ChatRequest):
         400: empty message.
         502: Mistral API call failed.
     """
-    if request.session_id not in sessions:
+    session = _sessions.get(request.session_id)
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{request.session_id}' not found. Please upload a PDF first.",
@@ -407,8 +412,7 @@ async def chat(request: ChatRequest):
             detail="Message cannot be empty.",
         )
 
-    history = histories[request.session_id]
-    session_meta = sessions[request.session_id]
+    history = _histories.get(request.session_id)
 
     print(
         f"[main] Chat | session={request.session_id} "
@@ -417,13 +421,13 @@ async def chat(request: ChatRequest):
 
     # ── Document-level fast path ──────────────────────────────────────────────
 
-    doc_summary = session_meta.get("doc_summary")
+    doc_summary = session.doc_summary
 
     if is_document_level_query(message) and doc_summary:
         print(f"[main] ROUTE: doc_summary (skipping vector retrieval)")
-        answer = format_summary_answer(message, doc_summary, session_meta["filename"])
-        history.append({"role": "user",      "content": message})
-        history.append({"role": "assistant",  "content": answer})
+        answer = format_summary_answer(message, doc_summary.to_dict(), session.filename)
+        _histories.append(request.session_id, "user", message)
+        _histories.append(request.session_id, "assistant", answer)
         print(f"[main] Chat answered | source=doc_summary | is_refusal=False")
         return {
             "answer":      answer,
@@ -459,8 +463,8 @@ async def chat(request: ChatRequest):
             detail=f"LLM call failed: {exc}",
         ) from exc
 
-    history.append({"role": "user",     "content": message})
-    history.append({"role": "assistant", "content": result["answer"]})
+    _histories.append(request.session_id, "user", message)
+    _histories.append(request.session_id, "assistant", result["answer"])
 
     refusal = is_refusal(result["answer"])
     print(
@@ -498,7 +502,8 @@ async def chat_stream(request: ChatRequest):
         404: session_id not found.
         400: empty message.
     """
-    if request.session_id not in sessions:
+    session = _sessions.get(request.session_id)
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{request.session_id}' not found. Please upload a PDF first.",
@@ -511,9 +516,8 @@ async def chat_stream(request: ChatRequest):
             detail="Message cannot be empty.",
         )
 
-    history = histories[request.session_id]
-    session_meta = sessions[request.session_id]
-    doc_summary = session_meta.get("doc_summary")
+    history = _histories.get(request.session_id)
+    doc_summary = session.doc_summary
 
     print(
         f"[main] Chat/stream | session={request.session_id} "
@@ -523,9 +527,9 @@ async def chat_stream(request: ChatRequest):
     # ── Document-level fast path — stream the summary as a single token ───────
     if is_document_level_query(message) and doc_summary:
         print(f"[main] ROUTE: doc_summary (streaming, skipping vector retrieval)")
-        answer = format_summary_answer(message, doc_summary, session_meta["filename"])
-        history.append({"role": "user",      "content": message})
-        history.append({"role": "assistant", "content": answer})
+        answer = format_summary_answer(message, doc_summary.to_dict(), session.filename)
+        _histories.append(request.session_id, "user", message)
+        _histories.append(request.session_id, "assistant", answer)
 
         def _summary_stream():
             yield json.dumps({"type": "token", "text": answer}, ensure_ascii=False) + "\n"
@@ -543,6 +547,7 @@ async def chat_stream(request: ChatRequest):
     # ── Normal streaming retrieval path ──────────────────────────────────────
     # Snapshot history BEFORE the new turn so the agent sees prior context only.
     history_snapshot = list(history)
+    session_id = request.session_id
 
     def _event_stream():
         final_answer = None
@@ -574,8 +579,8 @@ async def chat_stream(request: ChatRequest):
         finally:
             # Persist the turn only if we got a complete answer.
             if final_answer is not None:
-                history.append({"role": "user",      "content": message})
-                history.append({"role": "assistant", "content": final_answer})
+                _histories.append(session_id, "user", message)
+                _histories.append(session_id, "assistant", final_answer)
                 print(
                     f"[main] Chat/stream persisted | source=vector_retrieval | "
                     f"is_refusal={is_refusal(final_answer)}"
@@ -594,7 +599,7 @@ async def debug_retrieval(session_id: str):
     Raises:
         404: session_id not found.
     """
-    if session_id not in sessions:
+    if not _sessions.exists(session_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
@@ -621,25 +626,25 @@ async def get_session(session_id: str):
     Raises:
         404: session_id not found.
     """
-    if session_id not in sessions:
+    session = _sessions.get(session_id)
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
         )
 
-    meta = sessions[session_id]
-    doc = meta.get("doc_summary")
+    doc = session.doc_summary
 
     return {
         "session_id":  session_id,
-        "filename":    meta["filename"],
-        "chunk_count": meta["chunk_count"],
-        "status":      meta.get("status", "ready"),
-        "summary":     doc.get("summary") if doc else None,
+        "filename":    session.filename,
+        "chunk_count": session.chunk_count,
+        "status":      session.status,
+        "summary":     doc.summary if doc else None,
         "summary_meta": {
-            "title":         doc.get("title"),
-            "topics":        doc.get("topics"),
-            "document_type": doc.get("document_type"),
+            "title":         doc.title,
+            "topics":        doc.topics,
+            "document_type": doc.document_type,
         } if doc else None,
     }
 
@@ -659,15 +664,15 @@ async def session_status(session_id: str):
     Raises:
         404: session_id not found.
     """
-    if session_id not in sessions:
+    session = _sessions.get(session_id)
+    if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
         )
-    meta = sessions[session_id]
     return {
-        "status":      meta.get("status", "ready"),
-        "chunk_count": meta.get("chunk_count", 0),
+        "status":      session.status,
+        "chunk_count": session.chunk_count,
     }
 
 
@@ -679,7 +684,7 @@ async def delete_session(session_id: str):
     Raises:
         404: session_id not found.
     """
-    if session_id not in sessions:
+    if not _sessions.exists(session_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
@@ -692,8 +697,8 @@ async def delete_session(session_id: str):
     except (QdrantUnavailableError, ConfigError) as exc:
         print(f"[main] Session delete: Qdrant unavailable, dropping local state only: {exc}")
 
-    sessions.pop(session_id, None)
-    histories.pop(session_id, None)
+    _sessions.delete(session_id)
+    _histories.drop(session_id)
 
     print(f"[main] Session deleted | id={session_id}")
     return {"message": "Session deleted successfully.", "session_id": session_id}

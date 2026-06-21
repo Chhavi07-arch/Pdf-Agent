@@ -10,10 +10,8 @@ from __future__ import annotations
 
 from typing import List
 
-from app.infrastructure.pymupdf_parser import PyMuPDFParser
+from app import container
 from app.infrastructure.recursive_chunker import RecursiveChunker
-
-_parser = PyMuPDFParser()
 
 
 def parse_and_chunk(
@@ -30,6 +28,6 @@ def parse_and_chunk(
     Raises:
         ValueError: for unusable PDFs (encrypted, image-only, empty).
     """
-    pages = _parser.parse(pdf_bytes)
+    pages = container.parser().parse(pdf_bytes)
     chunker = RecursiveChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return [c.to_dict() for c in chunker.chunk(pages)]
