@@ -1,16 +1,15 @@
 """
-embeddings.py — Embedding generation and Qdrant vector store.
+embeddings.py — Hybrid retrieval orchestration (semantic + BM25 + rerank).
 
-Replaces the previous NumPy in-memory store with Qdrant.
+Embedding and Qdrant I/O are delegated to the infrastructure layer
+(SentenceTransformerEmbedder, QdrantVectorStore); this module composes them
+with the per-session BM25 index and cross-encoder reranker, and exposes the
+retrieval/upsert/delete API used by agent.py and main.py.
 
-Connection mode (chosen at startup via env vars, lazy-initialized on first use):
-  • QDRANT_URL + QDRANT_API_KEY set → Qdrant Cloud
-      Vectors are stored remotely; the Render process holds only the
-      embedding model (~90 MB), eliminating all per-session RAM overhead.
-  • Neither set → in-memory Qdrant (:memory:)
-      Same ephemeral behaviour as the old NumPy store, but with full
-      Qdrant semantics (HNSW indexing, typed payloads, cosine search).
-      Useful for local development without a cloud account.
+A running Qdrant server is mandatory — QDRANT_URL must be set. There is no
+in-memory fallback: if Qdrant is unconfigured or unreachable, the store raises
+ConfigError / QdrantUnavailableError, which the API surfaces as
+"Qdrant server not working".
 
 Collection strategy: one Qdrant collection per session_id.
   • session_id (UUID) becomes the collection name directly.
@@ -37,18 +36,11 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
 
 import numpy as np
-from qdrant_client import QdrantClient
-from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from qdrant_client.models import Distance, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import CrossEncoder
 
-from app.errors import ConfigError, QdrantUnavailableError
-
-# Qdrant client exceptions that indicate the server is unreachable or returned an
-# unexpected response. Translated to QdrantUnavailableError so the API layer can
-# answer "Qdrant server not working" instead of leaking vendor exception types.
-_QDRANT_ERRORS = (UnexpectedResponse, ResponseHandlingException, ConnectionError, TimeoutError, OSError)
+from app.infrastructure.qdrant_vector_store import QdrantVectorStore
+from app.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -124,8 +116,11 @@ _last_hybrid_stats: Dict[str, object] = {}
 # Module-level singletons (lazy-initialized on first use)
 # ---------------------------------------------------------------------------
 
-_model: Optional[SentenceTransformer] = None
-_client: Optional[QdrantClient] = None
+# Embedding model wrapper (lazy-loads the transformer on first encode).
+_embedder = SentenceTransformerEmbedder()
+# Qdrant-backed vector store (lazy-connects on first use). Constructed on first
+# access from the current QDRANT_URL/QDRANT_API_KEY env vars.
+_store: Optional[QdrantVectorStore] = None
 _cross_encoder: Optional[CrossEncoder] = None
 
 # Per-session BM25 keyword index, built during embed_and_store().
@@ -159,49 +154,23 @@ def _minmax_normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     return {k: (v - lo) / (hi - lo) for k, v in score_map.items()}
 
 
-def _get_model() -> SentenceTransformer:
-    """Return the shared sentence-transformer model, loading it on first call."""
-    global _model
-    if _model is None:
-        print("[embeddings] Loading sentence-transformers model (all-MiniLM-L6-v2)…")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-        print("[embeddings] Model loaded.")
-    return _model
-
-
-def _get_client() -> QdrantClient:
+def _get_store() -> QdrantVectorStore:
     """
-    Return the shared Qdrant client, initializing it on first call.
+    Return the shared Qdrant vector store, constructing it on first call from
+    the current QDRANT_URL / QDRANT_API_KEY environment variables.
 
-    A running Qdrant server is mandatory: QDRANT_URL must be set. The previous
-    in-memory (":memory:") fallback has been removed — if Qdrant is not
-    configured or cannot be reached, callers receive a clear error rather than
-    silently degrading to ephemeral, process-local storage.
-
-    The singleton is initialized once per process; restart to pick up new env vars.
-
-    Raises:
-        ConfigError:            QDRANT_URL is not set.
-        QdrantUnavailableError: The client could not be constructed/connected.
+    A running Qdrant server is mandatory — there is no in-memory fallback. The
+    store raises ConfigError (URL unset) or QdrantUnavailableError (unreachable)
+    on first use; callers propagate those so the API answers "Qdrant server not
+    working".
     """
-    global _client
-    if _client is None:
-        url = os.getenv("QDRANT_URL", "").strip()
-        api_key = os.getenv("QDRANT_API_KEY", "").strip()
-
-        if not url:
-            raise ConfigError(
-                "QDRANT_URL is not set. A running Qdrant server is required — "
-                "the in-memory fallback has been removed."
-            )
-
-        print(f"[embeddings] Connecting to Qdrant at {url!r}…")
-        try:
-            _client = QdrantClient(url=url, api_key=api_key or None, timeout=30)
-        except _QDRANT_ERRORS as exc:
-            raise QdrantUnavailableError(f"Could not connect to Qdrant: {exc!r}") from exc
-        print("[embeddings] Qdrant client ready.")
-    return _client
+    global _store
+    if _store is None:
+        _store = QdrantVectorStore(
+            url=os.getenv("QDRANT_URL", "").strip(),
+            api_key=os.getenv("QDRANT_API_KEY", "").strip(),
+        )
+    return _store
 
 
 def get_cross_encoder() -> CrossEncoder:
@@ -217,21 +186,6 @@ def get_cross_encoder() -> CrossEncoder:
         _cross_encoder = CrossEncoder(_CROSS_ENCODER_MODEL)
         print("[embeddings] Cross encoder loaded")
     return _cross_encoder
-
-
-def _encode_in_batches(
-    model: SentenceTransformer,
-    texts: List[str],
-    batch_size: int = 8,
-) -> np.ndarray:
-    """Encode texts in small batches with GC between each. Returns (N, D) float32 array."""
-    batches = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        embs = model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
-        batches.append(embs.astype(np.float32))
-        gc.collect()
-    return np.vstack(batches)
 
 
 # ---------------------------------------------------------------------------
@@ -258,45 +212,30 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
     if not chunks:
         raise ValueError("chunk list is empty — nothing to embed")
 
-    client = _get_client()
-    model = _get_model()
+    store = _get_store()
 
     # Drop stale collection if it exists, then create fresh.
-    try:
-        if client.collection_exists(collection_name=session_id):
-            client.delete_collection(collection_name=session_id)
-
-        client.create_collection(
-            collection_name=session_id,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant collection setup failed: {exc!r}") from exc
+    store.create_collection(session_id, VECTOR_SIZE)
 
     texts = [c["text"] for c in chunks]
     print(f"[embeddings] Embedding {len(texts)} chunk(s) for session '{session_id}'…")
 
-    embeddings = _encode_in_batches(model, texts)
+    embeddings = _embedder.encode(texts)
 
-    points = [
-        PointStruct(
-            id=i,
-            vector=embeddings[i].tolist(),
-            payload={
-                "text":        chunks[i]["text"],
-                "page":        chunks[i]["page"],
-                "chunk_index": chunks[i]["chunk_index"],
-                "section":     chunks[i].get("section", "Unknown"),
-            },
-        )
+    ids = list(range(len(chunks)))
+    vectors = [embeddings[i].tolist() for i in range(len(chunks))]
+    payloads = [
+        {
+            "text":        chunks[i]["text"],
+            "page":        chunks[i]["page"],
+            "chunk_index": chunks[i]["chunk_index"],
+            "section":     chunks[i].get("section", "Unknown"),
+        }
         for i in range(len(chunks))
     ]
 
     # Single upsert — all PDF sessions have O(100) chunks, well within one batch.
-    try:
-        client.upsert(collection_name=session_id, points=points)
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant upsert failed: {exc!r}") from exc
+    store.upsert(session_id, ids, vectors, payloads)
 
     del embeddings
     gc.collect()
@@ -339,41 +278,12 @@ def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
     implementation, just factored out). Each result's "score" is the raw cosine
     similarity in [−1, 1] — this is the value agent.py's confidence bands rely on.
     """
-    client = _get_client()
-    try:
-        if not client.collection_exists(collection_name=session_id):
-            print(f"[embeddings] Session '{session_id}' not found — returning empty results.")
-            return []
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant collection lookup failed: {exc!r}") from exc
-
-    model = _get_model()
-    query_vec: list[float] = (
-        model.encode([query], show_progress_bar=False, convert_to_numpy=True)[0]
-        .astype(np.float32)
-        .tolist()
-    )
-
-    try:
-        hits = client.search(
-            collection_name=session_id,
-            query_vector=query_vec,
-            limit=limit,
-            with_payload=True,
-        )
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant search failed: {exc!r}") from exc
-
-    return [
-        {
-            "text":        h.payload["text"],
-            "page":        h.payload["page"],
-            "chunk_index": h.payload["chunk_index"],
-            "section":     h.payload.get("section", "Unknown"),
-            "score":       float(h.score),
-        }
-        for h in hits
-    ]
+    store = _get_store()
+    query_vec: list[float] = _embedder.encode([query])[0].astype(np.float32).tolist()
+    results = store.search(session_id, query_vec, limit)
+    # Return dicts so the downstream hybrid/fusion/rerank code (still dict-based)
+    # is unchanged; each dict carries text/page/chunk_index/section/score.
+    return [r.to_dict() for r in results]
 
 
 def _bm25_search(query: str, session_id: str, limit: int) -> List[dict]:
@@ -815,20 +725,14 @@ def delete_session(session_id: str) -> None:
     Args:
         session_id: UUID string identifying the session to remove.
     """
-    client = _get_client()
+    store = _get_store()
 
     # Drop the in-memory BM25 index regardless of Qdrant state.
     if _bm25_indexes.pop(session_id, None) is not None:
         print(f"[embeddings] Dropped BM25 index for session '{session_id}'.")
     _last_retrieval_debug.pop(session_id, None)
 
-    try:
-        if not client.collection_exists(collection_name=session_id):
-            print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
-            return
-        client.delete_collection(collection_name=session_id)
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant delete failed: {exc!r}") from exc
+    store.delete_collection(session_id)
     print(f"[embeddings] Deleted Qdrant collection '{session_id}'.")
 
 
@@ -849,15 +753,11 @@ def warmup() -> None:
     one-time model-load cost instead.
     """
     print("[embeddings] Warmup: initializing Qdrant client only (models load lazily).")
-    client = _get_client()
     # Probe connectivity so an unreachable/misconfigured Qdrant surfaces in the
     # startup logs immediately. Raises ConfigError / QdrantUnavailableError, which
     # the caller (main.lifespan) logs without crashing the process — requests then
     # fail fast with "Qdrant server not working" instead of hanging.
-    try:
-        client.get_collections()
-    except _QDRANT_ERRORS as exc:
-        raise QdrantUnavailableError(f"Qdrant not reachable at startup: {exc!r}") from exc
+    _get_store().warmup()
     print("[embeddings] Warmup complete — Qdrant reachable; no transformer models loaded at startup.")
 
 
@@ -867,8 +767,8 @@ def get_status() -> dict:
     Used by the /health/debug endpoint — never raises.
     """
     return {
-        "model_loaded":      _model is not None,
-        "client_initialized": _client is not None,
+        "model_loaded":       _embedder.is_loaded,
+        "client_initialized": _store is not None and _store.is_initialized,
     }
 
 
@@ -877,11 +777,6 @@ def check_qdrant_connectivity() -> bool:
     Probe Qdrant with a lightweight list-collections call.
     Returns True if the call succeeds, False on any error.
     """
-    if _client is None:
+    if _store is None:
         return False
-    try:
-        _client.get_collections()
-        return True
-    except Exception as exc:
-        print(f"[embeddings] Qdrant connectivity check failed: {exc!r}")
-        return False
+    return _store.ping()
