@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import gc
 import os
-import re
-import time
 from typing import Dict, List, Optional
 
 # transformers (pulled in by sentence-transformers) auto-imports its TensorFlow
@@ -36,9 +34,10 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
 
 import numpy as np
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
 
+from app.domain.models import Chunk, RetrievedChunk
+from app.infrastructure.bm25_keyword_index import BM25KeywordIndex
+from app.infrastructure.cross_encoder_reranker import CrossEncoderReranker
 from app.infrastructure.qdrant_vector_store import QdrantVectorStore
 from app.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
@@ -81,9 +80,9 @@ _SEMANTIC_WEIGHT = 0.6
 _BM25_WEIGHT = 0.4
 
 # Cross-encoder reranker (Step 2). The 20-candidate hybrid pool is re-scored by
-# this model and trimmed to the best _RERANK_TOP_K, which both improves
-# precision and shrinks the LLM prompt. Loaded lazily (NOT at startup).
-_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# the CrossEncoderReranker and trimmed to the best _RERANK_TOP_K, which both
+# improves precision and shrinks the LLM prompt. The model loads lazily (NOT at
+# startup) inside CrossEncoderReranker.
 _RERANK_TOP_K = 7
 
 # Cross-encoder reranking is the single largest memory cost (a second transformer
@@ -121,19 +120,11 @@ _embedder = SentenceTransformerEmbedder()
 # Qdrant-backed vector store (lazy-connects on first use). Constructed on first
 # access from the current QDRANT_URL/QDRANT_API_KEY env vars.
 _store: Optional[QdrantVectorStore] = None
-_cross_encoder: Optional[CrossEncoder] = None
-
-# Per-session BM25 keyword index, built during embed_and_store().
-#   session_id -> {"bm25": BM25Okapi, "chunks": List[dict]}
-# Held in process memory only. With Qdrant Cloud, vectors persist across a
-# restart but this dict does not — retrieval falls back to semantic-only for
-# any pre-restart session (handled gracefully in _bm25_search).
-_bm25_indexes: Dict[str, dict] = {}
-
-
-def _tokenize(text: str) -> List[str]:
-    """Lowercase alphanumeric word tokenizer used for BM25 indexing/querying."""
-    return re.findall(r"[a-z0-9]+", text.lower())
+# Per-session BM25 keyword index (in process memory; semantic-only fallback if a
+# session has no index, e.g. after a restart) and the cross-encoder reranker
+# (model loads lazily on first rerank).
+_keyword_index = BM25KeywordIndex()
+_reranker = CrossEncoderReranker()
 
 
 def _minmax_normalize(score_map: Dict[int, float]) -> Dict[int, float]:
@@ -171,21 +162,6 @@ def _get_store() -> QdrantVectorStore:
             api_key=os.getenv("QDRANT_API_KEY", "").strip(),
         )
     return _store
-
-
-def get_cross_encoder() -> CrossEncoder:
-    """
-    Return the shared cross-encoder reranker, loading it on first call.
-
-    Loaded lazily on the first reranked query — never at application startup —
-    so cold-start (and the upload critical path) does not pay for this model.
-    """
-    global _cross_encoder
-    if _cross_encoder is None:
-        print("[embeddings] Loading cross encoder...")
-        _cross_encoder = CrossEncoder(_CROSS_ENCODER_MODEL)
-        print("[embeddings] Cross encoder loaded")
-    return _cross_encoder
 
 
 # ---------------------------------------------------------------------------
@@ -248,28 +224,8 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
 
 
 def _build_bm25_index(chunks: List[dict], session_id: str) -> None:
-    """
-    Build and cache an in-memory BM25Okapi index for a session.
-
-    Stores a lightweight copy of each chunk's payload (text, page, chunk_index,
-    section) parallel to the tokenized corpus so BM25 hits can be returned in
-    the same shape as semantic hits.
-    """
-    corpus_tokens = [_tokenize(c["text"]) for c in chunks]
-    bm25 = BM25Okapi(corpus_tokens)
-    _bm25_indexes[session_id] = {
-        "bm25": bm25,
-        "chunks": [
-            {
-                "text":        c["text"],
-                "page":        c["page"],
-                "chunk_index": c["chunk_index"],
-                "section":     c.get("section", "Unknown"),
-            }
-            for c in chunks
-        ],
-    }
-    print(f"[embeddings] Built BM25 index for session '{session_id}' ({len(chunks)} docs).")
+    """Build the per-session BM25 keyword index (delegates to BM25KeywordIndex)."""
+    _keyword_index.build(session_id, [Chunk.from_dict(c) for c in chunks])
 
 
 def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
@@ -288,34 +244,12 @@ def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
 
 def _bm25_search(query: str, session_id: str, limit: int) -> List[dict]:
     """
-    BM25 keyword retrieval over the per-session index.
+    BM25 keyword retrieval over the per-session index (delegates to BM25KeywordIndex).
 
-    Returns up to `limit` chunks with positive BM25 score, each carrying its raw
-    BM25 score under "score". Returns [] (semantic-only fallback) if the session
-    has no in-memory BM25 index — e.g. a Qdrant Cloud session that survived a
-    process restart.
+    Returns up to `limit` chunk dicts with positive raw BM25 score under "score";
+    [] (semantic-only fallback) if the session has no in-memory index.
     """
-    entry = _bm25_indexes.get(session_id)
-    if not entry:
-        print(f"[embeddings] No BM25 index for session '{session_id}' — semantic-only fallback.")
-        return []
-
-    tokens = _tokenize(query)
-    if not tokens:
-        return []
-
-    bm25: BM25Okapi = entry["bm25"]
-    chunks: List[dict] = entry["chunks"]
-    scores = bm25.get_scores(tokens)  # np.ndarray aligned with chunks
-
-    order = np.argsort(scores)[::-1][:limit]
-    results = []
-    for i in order:
-        if scores[i] <= 0:
-            continue  # no term overlap — not a real keyword match
-        c = chunks[int(i)]
-        results.append({**c, "score": float(scores[i])})
-    return results
+    return [r.to_dict() for r in _keyword_index.search(session_id, query, limit)]
 
 
 def _hybrid_search(
@@ -414,55 +348,17 @@ def _rerank_candidates(
     final_k: int = _RERANK_TOP_K,
 ) -> List[dict]:
     """
-    Re-score hybrid candidates with the cross-encoder and keep the best `final_k`.
+    Re-score hybrid candidates and keep the best `final_k` (delegates to
+    CrossEncoderReranker).
 
-    A cross-encoder reads (query, chunk_text) jointly rather than comparing two
-    independent embeddings, so it judges relevance far more precisely than the
-    bi-encoder used for retrieval — at a cost only affordable on a small
-    candidate set, which is exactly what hybrid retrieval has narrowed us to.
-
-    Each surviving chunk gains a "rerank_score" field; all existing fields
-    (score, semantic_score, bm25_score, fused_score) are preserved untouched.
-
-    On any failure (model load or predict error) this degrades gracefully to the
-    fused order so retrieval never breaks — the chunks then carry their
-    fused_score copied into rerank_score for schema consistency.
+    Bridges the dict-based hybrid layer to the domain-model reranker: dict
+    candidates are converted to RetrievedChunk, reranked, and converted back so
+    each returned dict gains a "rerank_score" with all other fields preserved.
     """
     if not candidates:
         return []
-
-    print(f"[embeddings] Reranking {len(candidates)} candidates")
-    t0 = time.monotonic()
-    try:
-        cross_encoder = get_cross_encoder()
-        pairs = [(query, c["text"]) for c in candidates]
-        scores = cross_encoder.predict(pairs)
-
-        reranked = [
-            {**c, "rerank_score": round(float(s), 4)}
-            for c, s in zip(candidates, scores)
-        ]
-        reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
-        reranked = reranked[:final_k]
-
-        elapsed = time.monotonic() - t0
-        print(
-            f"[embeddings] Cross encoder top score="
-            f"{reranked[0]['rerank_score'] if reranked else 'n/a'}"
-        )
-        print(f"[embeddings] Returning top {len(reranked)} reranked chunks")
-        print(f"[embeddings] Rerank completed in {elapsed:.2f}s")
-        return reranked
-
-    except Exception as exc:
-        print(
-            f"[embeddings] Rerank failed: {exc!r} — falling back to fused order "
-            f"(no quality gain this query, but retrieval still works)."
-        )
-        return [
-            {**c, "rerank_score": c.get("fused_score")}
-            for c in candidates[:final_k]
-        ]
+    ranked = _reranker.rerank(query, [RetrievedChunk.from_dict(c) for c in candidates], final_k)
+    return [r.to_dict() for r in ranked]
 
 
 def retrieve_relevant_chunks(
@@ -728,8 +624,7 @@ def delete_session(session_id: str) -> None:
     store = _get_store()
 
     # Drop the in-memory BM25 index regardless of Qdrant state.
-    if _bm25_indexes.pop(session_id, None) is not None:
-        print(f"[embeddings] Dropped BM25 index for session '{session_id}'.")
+    _keyword_index.drop(session_id)
     _last_retrieval_debug.pop(session_id, None)
 
     store.delete_collection(session_id)
