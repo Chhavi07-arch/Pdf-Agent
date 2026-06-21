@@ -1,0 +1,28 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PDF Chat Agent">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded gradient tile -->
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+
+  <!-- Document page with a folded corner -->
+  <path d="M20 14h16l10 10v22a4 4 0 0 1-4 4H20a4 4 0 0 1-4-4V18a4 4 0 0 1 4-4z" fill="#ffffff"/>
+  <path d="M36 14l10 10h-8a2 2 0 0 1-2-2v-8z" fill="#c4b5fd"/>
+
+  <!-- Text lines on the page -->
+  <rect x="22" y="29" width="14" height="3" rx="1.5" fill="#a78bfa"/>
+  <rect x="22" y="35" width="20" height="3" rx="1.5" fill="#c4b5fd"/>
+  <rect x="22" y="41" width="16" height="3" rx="1.5" fill="#c4b5fd"/>
+
+  <!-- Chat bubble accent (the "agent") -->
+  <g>
+    <path d="M40 40a9 9 0 1 1-4.2 17l-5.3 1.4 1.5-5A9 9 0 0 1 40 40z" fill="#1e1b4b" stroke="#ffffff" stroke-width="2.5"/>
+    <circle cx="36.5" cy="49" r="1.4" fill="#ffffff"/>
+    <circle cx="41" cy="49" r="1.4" fill="#ffffff"/>
+    <circle cx="45.5" cy="49" r="1.4" fill="#ffffff"/>
+  </g>
+</svg>
