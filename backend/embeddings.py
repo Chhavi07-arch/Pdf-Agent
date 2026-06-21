@@ -38,9 +38,17 @@ os.environ.setdefault("USE_FLAX", "0")
 
 import numpy as np
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
+
+from app.errors import ConfigError, QdrantUnavailableError
+
+# Qdrant client exceptions that indicate the server is unreachable or returned an
+# unexpected response. Translated to QdrantUnavailableError so the API layer can
+# answer "Qdrant server not working" instead of leaking vendor exception types.
+_QDRANT_ERRORS = (UnexpectedResponse, ResponseHandlingException, ConnectionError, TimeoutError, OSError)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -165,29 +173,34 @@ def _get_client() -> QdrantClient:
     """
     Return the shared Qdrant client, initializing it on first call.
 
-    Checks QDRANT_URL and QDRANT_API_KEY environment variables:
-      • Both present → connects to Qdrant Cloud (persistent, remote storage).
-      • Not set      → creates an in-memory Qdrant instance (ephemeral, local).
+    A running Qdrant server is mandatory: QDRANT_URL must be set. The previous
+    in-memory (":memory:") fallback has been removed — if Qdrant is not
+    configured or cannot be reached, callers receive a clear error rather than
+    silently degrading to ephemeral, process-local storage.
 
     The singleton is initialized once per process; restart to pick up new env vars.
+
+    Raises:
+        ConfigError:            QDRANT_URL is not set.
+        QdrantUnavailableError: The client could not be constructed/connected.
     """
     global _client
     if _client is None:
         url = os.getenv("QDRANT_URL", "").strip()
         api_key = os.getenv("QDRANT_API_KEY", "").strip()
 
-        if url:
-            print(f"[embeddings] Connecting to Qdrant Cloud at {url!r}…")
-            _client = QdrantClient(
-                url=url,
-                api_key=api_key or None,
-                timeout=30,
+        if not url:
+            raise ConfigError(
+                "QDRANT_URL is not set. A running Qdrant server is required — "
+                "the in-memory fallback has been removed."
             )
-            print("[embeddings] Qdrant Cloud client ready.")
-        else:
-            print("[embeddings] QDRANT_URL not set — using in-memory Qdrant.")
-            _client = QdrantClient(":memory:")
-            print("[embeddings] In-memory Qdrant client ready.")
+
+        print(f"[embeddings] Connecting to Qdrant at {url!r}…")
+        try:
+            _client = QdrantClient(url=url, api_key=api_key or None, timeout=30)
+        except _QDRANT_ERRORS as exc:
+            raise QdrantUnavailableError(f"Could not connect to Qdrant: {exc!r}") from exc
+        print("[embeddings] Qdrant client ready.")
     return _client
 
 
@@ -249,13 +262,16 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
     model = _get_model()
 
     # Drop stale collection if it exists, then create fresh.
-    if client.collection_exists(collection_name=session_id):
-        client.delete_collection(collection_name=session_id)
+    try:
+        if client.collection_exists(collection_name=session_id):
+            client.delete_collection(collection_name=session_id)
 
-    client.create_collection(
-        collection_name=session_id,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-    )
+        client.create_collection(
+            collection_name=session_id,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant collection setup failed: {exc!r}") from exc
 
     texts = [c["text"] for c in chunks]
     print(f"[embeddings] Embedding {len(texts)} chunk(s) for session '{session_id}'…")
@@ -277,7 +293,10 @@ def embed_and_store(chunks: List[dict], session_id: str) -> None:
     ]
 
     # Single upsert — all PDF sessions have O(100) chunks, well within one batch.
-    client.upsert(collection_name=session_id, points=points)
+    try:
+        client.upsert(collection_name=session_id, points=points)
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant upsert failed: {exc!r}") from exc
 
     del embeddings
     gc.collect()
@@ -321,9 +340,12 @@ def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
     similarity in [−1, 1] — this is the value agent.py's confidence bands rely on.
     """
     client = _get_client()
-    if not client.collection_exists(collection_name=session_id):
-        print(f"[embeddings] Session '{session_id}' not found — returning empty results.")
-        return []
+    try:
+        if not client.collection_exists(collection_name=session_id):
+            print(f"[embeddings] Session '{session_id}' not found — returning empty results.")
+            return []
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant collection lookup failed: {exc!r}") from exc
 
     model = _get_model()
     query_vec: list[float] = (
@@ -332,12 +354,15 @@ def _semantic_search(query: str, session_id: str, limit: int) -> List[dict]:
         .tolist()
     )
 
-    hits = client.search(
-        collection_name=session_id,
-        query_vector=query_vec,
-        limit=limit,
-        with_payload=True,
-    )
+    try:
+        hits = client.search(
+            collection_name=session_id,
+            query_vector=query_vec,
+            limit=limit,
+            with_payload=True,
+        )
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant search failed: {exc!r}") from exc
 
     return [
         {
@@ -797,11 +822,13 @@ def delete_session(session_id: str) -> None:
         print(f"[embeddings] Dropped BM25 index for session '{session_id}'.")
     _last_retrieval_debug.pop(session_id, None)
 
-    if not client.collection_exists(collection_name=session_id):
-        print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
-        return
-
-    client.delete_collection(collection_name=session_id)
+    try:
+        if not client.collection_exists(collection_name=session_id):
+            print(f"[embeddings] Session '{session_id}' not found — nothing to delete.")
+            return
+        client.delete_collection(collection_name=session_id)
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant delete failed: {exc!r}") from exc
     print(f"[embeddings] Deleted Qdrant collection '{session_id}'.")
 
 
@@ -822,8 +849,16 @@ def warmup() -> None:
     one-time model-load cost instead.
     """
     print("[embeddings] Warmup: initializing Qdrant client only (models load lazily).")
-    _get_client()
-    print("[embeddings] Warmup complete — no transformer models loaded at startup.")
+    client = _get_client()
+    # Probe connectivity so an unreachable/misconfigured Qdrant surfaces in the
+    # startup logs immediately. Raises ConfigError / QdrantUnavailableError, which
+    # the caller (main.lifespan) logs without crashing the process — requests then
+    # fail fast with "Qdrant server not working" instead of hanging.
+    try:
+        client.get_collections()
+    except _QDRANT_ERRORS as exc:
+        raise QdrantUnavailableError(f"Qdrant not reachable at startup: {exc!r}") from exc
+    print("[embeddings] Warmup complete — Qdrant reachable; no transformer models loaded at startup.")
 
 
 def get_status() -> dict:

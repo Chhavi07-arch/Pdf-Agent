@@ -18,9 +18,10 @@ Usage:
                   (free, fast): "refused" means zero chunks retrieved.
 
 Isolation:
-    By default the script forces an in-memory Qdrant so it never touches your
-    cloud collections. Set EVAL_USE_CLOUD=1 to evaluate against the configured
-    QDRANT_URL instead (a unique session is used and deleted afterwards).
+    The in-memory Qdrant fallback has been removed, so evaluation runs against the
+    configured Qdrant server (QDRANT_URL must be set). A unique eval-<uuid> session
+    is created and deleted afterwards, so the script never touches your application
+    collections even on a shared cluster.
 
 This is an observability tool — it does not modify any retrieval or agent logic.
 """
@@ -37,12 +38,6 @@ from dotenv import load_dotenv
 
 # Load .env (MISTRAL_API_KEY, QDRANT_*) before importing embeddings/agent.
 load_dotenv()
-
-# Isolate evaluation in in-memory Qdrant unless explicitly opted out. Must be set
-# before importing embeddings, which reads these env vars when it builds its client.
-if os.getenv("EVAL_USE_CLOUD") != "1":
-    os.environ["QDRANT_URL"] = ""
-    os.environ["QDRANT_API_KEY"] = ""
 
 from agent import _HIGH_CONFIDENCE_SCORE, get_answer, is_refusal  # noqa: E402
 from embeddings import delete_session, embed_and_store, retrieve_relevant_chunks  # noqa: E402
@@ -90,8 +85,12 @@ def run_evaluation(pdf_path: str, full: bool) -> int:
     print("  RETRIEVAL EVALUATION")
     print(f"  PDF   : {pdf_path}")
     print(f"  Mode  : {'FULL (retrieval + LLM answer)' if full else 'RETRIEVAL-ONLY'}")
-    print(f"  Qdrant: {'in-memory (isolated)' if os.getenv('EVAL_USE_CLOUD') != '1' else 'cloud'}")
+    print(f"  Qdrant: {os.getenv('QDRANT_URL', '').strip() or '(unset)'}")
     print("=" * 70)
+
+    if not os.getenv("QDRANT_URL", "").strip():
+        print("ERROR: QDRANT_URL must be set — the in-memory fallback has been removed.")
+        return 1
 
     if full and not os.getenv("MISTRAL_API_KEY"):
         print("ERROR: --full requires MISTRAL_API_KEY. Aborting.")

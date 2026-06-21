@@ -35,10 +35,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent import get_answer, is_refusal, stream_answer
+from app.errors import ConfigError, QdrantUnavailableError
 from embeddings import check_qdrant_connectivity, delete_session as _delete_session
 from embeddings import embed_and_store, get_last_retrieval_debug, get_status, warmup
 from pdf_processor import parse_and_chunk
 from summarizer import format_summary_answer, generate_doc_summary, is_document_level_query
+
+# User-facing message returned (HTTP 503) whenever Qdrant is unconfigured or
+# unreachable. The in-memory fallback has been removed, so this is a hard failure.
+QDRANT_DOWN_DETAIL = "Qdrant server not working"
 
 # Load .env before any os.getenv calls below
 load_dotenv()
@@ -324,6 +329,12 @@ async def upload_pdf(
     print(f"[main] Stage 2/3: Embedding {len(chunks)} chunks → Qdrant | session={session_id}")
     try:
         await asyncio.to_thread(embed_and_store, chunks, session_id)
+    except (QdrantUnavailableError, ConfigError) as exc:
+        print(f"[main] Stage 2 FAILED (Qdrant unavailable): {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=QDRANT_DOWN_DETAIL,
+        ) from exc
     except Exception as exc:
         print(f"[main] Stage 2 FAILED:\n{traceback.format_exc()}")
         raise HTTPException(
@@ -435,6 +446,12 @@ async def chat(request: ChatRequest):
             request.session_id,
             list(history),
         )
+    except (QdrantUnavailableError, ConfigError) as exc:
+        print(f"[main] Chat pipeline error (Qdrant unavailable): {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=QDRANT_DOWN_DETAIL,
+        ) from exc
     except Exception as exc:
         print(f"[main] Chat pipeline error:\n{traceback.format_exc()}")
         raise HTTPException(
@@ -542,6 +559,12 @@ async def chat_stream(request: ChatRequest):
                     except json.JSONDecodeError:
                         pass
                 yield line
+        except (QdrantUnavailableError, ConfigError) as exc:
+            print(f"[main] Chat/stream pipeline error (Qdrant unavailable): {exc}")
+            yield json.dumps(
+                {"type": "error", "text": QDRANT_DOWN_DETAIL},
+                ensure_ascii=False,
+            ) + "\n"
         except Exception as exc:
             print(f"[main] Chat/stream pipeline error:\n{traceback.format_exc()}")
             yield json.dumps(
@@ -662,7 +685,13 @@ async def delete_session(session_id: str):
             detail=f"Session '{session_id}' not found.",
         )
 
-    await asyncio.to_thread(_delete_session, session_id)
+    # Best-effort Qdrant cleanup: if Qdrant is unreachable we still drop the
+    # in-memory session state rather than failing the delete.
+    try:
+        await asyncio.to_thread(_delete_session, session_id)
+    except (QdrantUnavailableError, ConfigError) as exc:
+        print(f"[main] Session delete: Qdrant unavailable, dropping local state only: {exc}")
+
     sessions.pop(session_id, None)
     histories.pop(session_id, None)
 
