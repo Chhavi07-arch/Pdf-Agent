@@ -52,7 +52,7 @@ Each chunk is stored as `{"text": str, "page": int, "chunk_index": int}`.
 
 **Vector store**: Qdrant with `Distance.COSINE`. One collection is created per `session_id` (UUID). This gives natural session isolation — no metadata filter is needed on search, and cleanup is a single `delete_collection` call.
 
-**Connection**: reads `QDRANT_URL` and `QDRANT_API_KEY` at startup. If set, connects to Qdrant Cloud (persistent, remote). If not set, falls back to `QdrantClient(":memory:")` — same Qdrant semantics locally but ephemeral.
+**Connection**: reads `QDRANT_URL` and `QDRANT_API_KEY` (lazily, on first use). A running Qdrant server is **required** — there is no in-memory fallback. If `QDRANT_URL` is unset the store raises `ConfigError`; if the server is unreachable it raises `QdrantUnavailableError`. Both are surfaced by the API as HTTP 503 `"Qdrant server not working"`.
 
 **Score filtering**: after Qdrant returns the top-10 candidates, any chunk with cosine similarity below `MIN_RETRIEVAL_SCORE` (default 0.20, env var configurable) is discarded before the LLM sees it. Thresholds:
 - > 0.50 — clearly on-topic
@@ -121,7 +121,7 @@ Logging at each stage (`[agent]`, `[embeddings]`) records the final retrieval qu
 ## Limitations & Future Work
 
 - **No cross-session persistence**: session state (`sessions`, `histories` dicts in `main.py`) is in-memory. A Render dyno restart loses all active sessions. Future work: persist sessions to Redis or a lightweight DB.
-- **In-memory Qdrant fallback**: without `QDRANT_URL`, vectors are held in the process — evicted on restart and capped by dyno RAM. Suitable for development only.
+- **Qdrant required (no in-memory fallback)**: `QDRANT_URL` must point at a reachable Qdrant server. If it is unset or unreachable, requests fail with HTTP 503 rather than degrading to ephemeral memory. Run a local Qdrant (e.g. Docker) or a Qdrant Cloud cluster for development.
 - **Image-only PDFs**: PyMuPDF extracts text layer only. Scanned PDFs without OCR return empty text and the system refuses all queries. Future work: integrate an OCR step (e.g. pytesseract).
 - **Single PDF per session**: uploading a second PDF replaces the first (the existing Qdrant collection is dropped). Future work: multi-document sessions with per-document metadata filtering.
 - **Context window cap**: very long PDFs produce many chunks, but only the top-10 are sent to the LLM. Deep content buried after page 50 may be consistently outscored by earlier pages. Future work: maximal marginal relevance (MMR) re-ranking.

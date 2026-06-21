@@ -36,7 +36,7 @@ FastAPI (Render)
  └── DELETE /session/:id →  drops Qdrant collection for that session
 ```
 
-Session metadata and conversation history live in Python dicts in RAM (intentional for assessment scope; Redis + a persistent session store would be the production choice). Vector embeddings are stored in Qdrant — persistently in Qdrant Cloud when `QDRANT_URL` is set, or in an in-memory Qdrant instance otherwise.
+Session metadata and conversation history live in Python dicts in RAM, behind repository interfaces (intentional for assessment scope; Redis + a persistent session store would be the production choice). Vector embeddings are stored in Qdrant. **A running Qdrant server is required** — set `QDRANT_URL` (and `QDRANT_API_KEY`) to a reachable cluster. There is no in-memory fallback: if Qdrant is unconfigured or unreachable, `/upload` and `/chat` return HTTP 503 `"Qdrant server not working"` rather than silently degrading to ephemeral storage.
 
 ---
 
@@ -112,7 +112,7 @@ User question + conversation history
 
 ### 3. Vector search
 
-Uses Qdrant cosine similarity search. Each upload creates a dedicated Qdrant collection named after the session UUID. When `QDRANT_URL` is configured, vectors are stored remotely in Qdrant Cloud (persistent across Render restarts, zero local RAM overhead). Without `QDRANT_URL`, an in-memory Qdrant instance is used as a fallback — same behaviour as before but with full Qdrant semantics (HNSW indexing, typed payloads).
+Uses Qdrant cosine similarity search. Each upload creates a dedicated Qdrant collection named after the session UUID. `QDRANT_URL` must point at a reachable Qdrant Cloud cluster (or any Qdrant server); vectors are stored remotely and persist across Render restarts with zero local RAM overhead. There is **no in-memory fallback** — if `QDRANT_URL` is unset the app raises a configuration error, and if the server is unreachable it returns HTTP 503 `"Qdrant server not working"`.
 
 ---
 
@@ -210,10 +210,10 @@ If filtering removes all candidates, the fallback path in `agent.py` retries wit
 
 ### Vector database: Qdrant
 
-The system uses Qdrant as the vector database. The connection mode is chosen at startup from environment variables:
+The system uses Qdrant as the vector database. A running Qdrant server is **required** — the connection is configured from environment variables:
 
 - **`QDRANT_URL` + `QDRANT_API_KEY` set (Qdrant Cloud)** — vectors are stored remotely and persist across Render restarts. The Render process holds only the embedding model (~90 MB); per-session RAM overhead drops to zero.
-- **Neither set (in-memory fallback)** — Qdrant runs in-process using `:memory:` mode. Same ephemeral behaviour as the previous NumPy store, but with full Qdrant semantics: HNSW indexing, structured payloads, and proper cosine distance search.
+- **`QDRANT_URL` unset** — there is no in-memory fallback. The vector store raises a configuration error and requests fail fast with HTTP 503 `"Qdrant server not working"`. This is deliberate: silently degrading to ephemeral, process-local memory hides a broken deployment and loses data on every restart.
 
 Each PDF upload creates a dedicated Qdrant collection named after the session UUID. This gives natural isolation, makes deletions atomic (one `delete_collection` call), and avoids the need for per-query metadata filters. The collection is dropped automatically when the user removes the document.
 
@@ -270,7 +270,7 @@ On every `/chat` call, `is_document_level_query()` checks whether the question t
 
 | Decision | Chosen | Alternative | Reason for choice |
 |---|---|---|---|
-| Vector database | Qdrant (Cloud or :memory:) | ChromaDB, Pinecone | Lightweight client, persistent cloud option, free tier |
+| Vector database | Qdrant (server required) | ChromaDB, Pinecone | Lightweight client, persistent cloud option, free tier |
 | Collection strategy | One collection per session | Shared + filter | Simpler isolation, atomic deletion, no query filter overhead |
 | Chunking | `RecursiveCharacterTextSplitter` 900/200 | Manual char window 400/80 | Paragraph/sentence boundaries → better embeddings |
 | Retrieval k | 10 candidates → score filter | Fixed 5 or 10 | Oversample then discard noise rather than hard-cap |
@@ -288,16 +288,34 @@ On every `/chat` call, `is_document_level_query()` checks whether the question t
 
 ## Project structure
 
+The backend follows SOLID layering: small interface contracts in `app/interfaces/`,
+concrete adapters in `app/infrastructure/`, orchestration in `app/services/`, and a
+single composition root (`app/container.py`) that wires the object graph. The
+top-level modules (`main.py`, `agent.py`, `embeddings.py`, `pdf_processor.py`,
+`summarizer.py`) are thin facades that delegate to the container.
+
 ```
 pdf-agent/
 ├── backend/
-│   ├── main.py            # FastAPI app — routes, validation, session state, background tasks
-│   ├── agent.py           # Query normalisation, rewriting, expansion, Mistral call, citations
-│   ├── embeddings.py      # sentence-transformers encoding, Qdrant vector store + retrieval
-│   ├── summarizer.py      # Upload-time doc summary generation and global query routing
-│   ├── pdf_processor.py   # PyMuPDF parsing, RecursiveCharacterTextSplitter chunking
+│   ├── main.py                 # FastAPI routes + validation (delegates to repositories/services)
+│   ├── agent.py                # Facade → ChatService
+│   ├── embeddings.py           # Facade → HybridRetriever + vector store
+│   ├── pdf_processor.py        # Facade → parser + chunker
+│   ├── summarizer.py           # Facade → SummaryService
+│   ├── app/
+│   │   ├── config.py           # Settings (single env source) + constants
+│   │   ├── errors.py           # ConfigError, QdrantUnavailableError
+│   │   ├── container.py        # Composition root — wires the whole graph
+│   │   ├── domain/models.py    # Chunk, RetrievedChunk, DocSummary, Session, ChatResult
+│   │   ├── interfaces/         # ABCs: Embedder, VectorStore, KeywordIndex, Reranker,
+│   │   │                       #       Retriever, LLMClient, DocumentParser, Chunker, repos
+│   │   ├── infrastructure/     # QdrantVectorStore (no fallback), SentenceTransformerEmbedder,
+│   │   │                       #   BM25KeywordIndex, CrossEncoderReranker, MistralClient,
+│   │   │                       #   PyMuPDFParser, RecursiveChunker, in-memory repositories
+│   │   └── services/           # HybridRetriever, ChatService, QueryBuilder, PromptBuilder,
+│   │                           #   CitationService, SummaryService
 │   ├── requirements.txt
-│   ├── .python-version    # 3.11
+│   ├── .python-version         # 3.11
 │   └── .env.example
 └── frontend/
     ├── src/
@@ -368,8 +386,8 @@ Frontend runs at `http://localhost:5173`.
 | Variable | Default | Description |
 |---|---|---|
 | `MISTRAL_API_KEY` | — | **Required.** Mistral API key |
-| `QDRANT_URL` | *(blank)* | Qdrant Cloud cluster URL. If blank, falls back to in-memory Qdrant. |
-| `QDRANT_API_KEY` | *(blank)* | Qdrant Cloud API key. Required when `QDRANT_URL` is set. |
+| `QDRANT_URL` | *(blank)* | **Required.** Qdrant cluster URL. If unset, `/upload` and `/chat` return HTTP 503 — there is no in-memory fallback. |
+| `QDRANT_API_KEY` | *(blank)* | Qdrant Cloud API key. Required when `QDRANT_URL` points at a cloud cluster. |
 | `MIN_RETRIEVAL_SCORE` | `0.20` | Minimum cosine similarity score for a chunk to reach the LLM. |
 | `MAX_PDF_SIZE_MB` | `20` | Reject uploads larger than this |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,...` | CORS allowed origins |
@@ -425,7 +443,7 @@ Upload and index a PDF.
 }
 ```
 
-**Error codes:** `413` file too large · `415` not a PDF · `422` image-only / no extractable text
+**Error codes:** `413` file too large · `415` not a PDF · `422` image-only / no extractable text · `503` Qdrant server not working
 
 ### `POST /chat`
 Ask a question about an uploaded PDF.
@@ -446,7 +464,7 @@ Ask a question about an uploaded PDF.
 }
 ```
 
-**Error codes:** `404` session not found · `400` empty message · `502` Mistral API error
+**Error codes:** `404` session not found · `400` empty message · `502` Mistral API error · `503` Qdrant server not working
 
 ### `GET /health`
 Liveness probe. Returns `{"status": "ok", "active_sessions": N}`.
