@@ -9,8 +9,16 @@ Degrades gracefully to the fused order on any failure so retrieval never breaks.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import List, Optional
+
+# transformers auto-imports its TensorFlow backend when present, which crashes on
+# Keras 3. This app is PyTorch-only — disable the TF/Flax paths BEFORE importing
+# sentence_transformers. Set here too (not only in the embedder module) so the
+# guard holds regardless of which module imports sentence_transformers first.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
 
 from sentence_transformers import CrossEncoder
 
