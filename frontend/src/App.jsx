@@ -4,18 +4,112 @@ import ChatWindow from './components/ChatWindow'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
+// ── Session persistence ──────────────────────────────────────────────────────
+// sessionStorage has exactly the desired lifetime: it survives page reloads /
+// refreshes within the same tab and is automatically cleared when the tab (or
+// window) is closed. So the uploaded-document list and chat history come back on
+// refresh, but a brand-new tab starts clean.
+const SS = {
+  pdfs:   'pdfAgent.uploadedPdfs',
+  active: 'pdfAgent.activeSessionId',
+  msgs:   'pdfAgent.messagesMap',
+}
+
+function ssLoad(key, fallback) {
+  try {
+    const raw = sessionStorage.getItem(key)
+    return raw == null ? fallback : JSON.parse(raw)
+  } catch {
+    return fallback
+  }
+}
+
+function ssSave(key, value) {
+  try { sessionStorage.setItem(key, JSON.stringify(value)) } catch { /* quota / private mode */ }
+}
+
+// Drop in-flight streaming placeholders and clear stuck streaming flags, so a
+// refresh mid-generation doesn't restore a frozen blinking-cursor bubble.
+function sanitizeMessages(map) {
+  const out = {}
+  for (const sid of Object.keys(map || {})) {
+    out[sid] = (map[sid] || [])
+      .filter(m => !(m.role === 'assistant' && m.streaming && !m.content))
+      .map(m => (m.streaming ? { ...m, streaming: false } : m))
+  }
+  return out
+}
+
 export default function App() {
   useEffect(() => {
     // Wake up Render backend on app load
     fetch(`${API_BASE}/health`).catch(() => {})
   }, [])
 
-  // uploadedPdfs: [{sessionId, filename, chunkCount}, ...]
-  const [uploadedPdfs, setUploadedPdfs]       = useState([])
-  const [activeSessionId, setActiveSessionId] = useState(null)
+  // uploadedPdfs: [{sessionId, filename, chunkCount}, ...] — restored from sessionStorage
+  const [uploadedPdfs, setUploadedPdfs]       = useState(() => ssLoad(SS.pdfs, []))
+  const [activeSessionId, setActiveSessionId] = useState(() => ssLoad(SS.active, null))
   // messagesMap: {sessionId: Message[]}
-  const [messagesMap, setMessagesMap]         = useState({})
+  const [messagesMap, setMessagesMap]         = useState(() => sanitizeMessages(ssLoad(SS.msgs, {})))
   const [isLoading, setIsLoading]             = useState(false)
+
+  // Persist session state to sessionStorage on every change.
+  useEffect(() => { ssSave(SS.pdfs, uploadedPdfs) },       [uploadedPdfs])
+  useEffect(() => { ssSave(SS.active, activeSessionId) },  [activeSessionId])
+  useEffect(() => { ssSave(SS.msgs, messagesMap) },        [messagesMap])
+
+  // On first load, reconcile restored sessions with the backend: drop any the
+  // server no longer knows about (e.g. it restarted and lost in-memory session
+  // state) and refresh their summaries. Transient/network errors keep the
+  // session, so a Render cold start doesn't wrongly discard documents.
+  useEffect(() => {
+    const restored = ssLoad(SS.pdfs, [])
+    if (restored.length === 0) return
+    let cancelled = false
+
+    ;(async () => {
+      const results = await Promise.all(restored.map(async p => {
+        try {
+          const res = await fetch(`${API_BASE}/session/${p.sessionId}`)
+          if (res.status === 404) return { id: p.sessionId, alive: false }
+          if (res.ok) {
+            const d = await res.json()
+            return { id: p.sessionId, alive: true, summary: d.summary }
+          }
+          return { id: p.sessionId, alive: true }          // unknown status — keep
+        } catch {
+          return { id: p.sessionId, alive: true }          // transient — keep
+        }
+      }))
+      if (cancelled) return
+
+      const alive = new Set(results.filter(r => r.alive).map(r => r.id))
+      const summaryById = Object.fromEntries(
+        results.filter(r => r.alive).map(r => [r.id, r.summary])
+      )
+
+      setUploadedPdfs(prev => prev
+        .filter(p => alive.has(p.sessionId))
+        .map(p => (summaryById[p.sessionId] != null ? { ...p, summary: summaryById[p.sessionId] } : p)))
+
+      setMessagesMap(prev => {
+        const next = {}
+        for (const sid of Object.keys(prev)) if (alive.has(sid)) next[sid] = prev[sid]
+        return next
+      })
+
+      setActiveSessionId(prev =>
+        (prev && alive.has(prev)) ? prev : (alive.size ? [...alive][alive.size - 1] : null))
+
+      // Resume summary polling for any surviving session that still lacks one.
+      restored.forEach(p => {
+        if (alive.has(p.sessionId) && summaryById[p.sessionId] == null) loadSummary(p.sessionId)
+      })
+    })()
+
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const activeSession = uploadedPdfs.find(p => p.sessionId === activeSessionId) ?? null
   const messages      = activeSessionId ? (messagesMap[activeSessionId] ?? []) : []
